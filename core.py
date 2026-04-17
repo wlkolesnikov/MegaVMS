@@ -380,3 +380,16 @@ class ApplicationCore:
             on_done,
             on_error,
         )
+
+    def get_archive_playback_time(
+        self,
+        *,
+        handle: int,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.get_archive_playback_time(handle),
+            on_done,
+            on_error,
+        )

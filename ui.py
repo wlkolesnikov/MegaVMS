@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta
-import time
 
 import gi
 
@@ -84,8 +83,8 @@ class MainWindow(Gtk.Window):
         self.playback_paused = False
         self.playback_speed_factor = 1.0
         self.playback_position_time: datetime | None = None
-        self.playback_position_mono: float | None = None
         self.playback_tick_source_id = 0
+        self.playback_time_poll_pending = False
 
         self.set_default_size(1380, 920)
         self.connect("destroy", self._on_destroy)
@@ -484,19 +483,7 @@ class MainWindow(Gtk.Window):
         self.playback_info_label.set_text(text)
 
     def _current_playback_time(self) -> datetime | None:
-        if self.playback_position_time is None:
-            return None
-        if self.playback_paused or self.playback_position_mono is None:
-            return self.playback_position_time
-        current = self.playback_position_time + timedelta(
-            seconds=max(time.monotonic() - self.playback_position_mono, 0.0) * self.playback_speed_factor
-        )
-        if self.active_archive_file is not None:
-            if current < self.active_archive_file.start_time:
-                current = self.active_archive_file.start_time
-            if current > self.active_archive_file.end_time:
-                current = self.active_archive_file.end_time
-        return current
+        return self.playback_position_time
 
     def _anchor_playback_position(self, when: datetime, *, paused: bool | None = None, speed_factor: float | None = None) -> None:
         self.playback_position_time = when
@@ -504,16 +491,18 @@ class MainWindow(Gtk.Window):
             self.playback_paused = paused
         if speed_factor is not None:
             self.playback_speed_factor = speed_factor
-        self.playback_position_mono = None if self.playback_paused else time.monotonic()
 
     def _sync_playback_cursor(self) -> bool:
         if self.playback_handle < 0:
             return True
-        current = self._current_playback_time()
-        if current is None:
+        if self.playback_time_poll_pending:
             return True
-        self.timeline.set_cursor_time(current)
-        self._update_playback_state_label()
+        self.playback_time_poll_pending = True
+        self.core.get_archive_playback_time(
+            handle=self.playback_handle,
+            on_done=self._handle_playback_time_polled,
+            on_error=self._handle_playback_time_poll_error,
+        )
         return True
 
     def _ensure_playback_tick(self) -> None:
@@ -538,6 +527,23 @@ class MainWindow(Gtk.Window):
             f"state={state}, speed={self.playback_speed_factor:g}x, time={current_text}, handle={self.playback_handle}"
         )
 
+    def _handle_playback_time_polled(self, current: datetime | None) -> bool:
+        self.playback_time_poll_pending = False
+        if self.playback_handle < 0:
+            return False
+        if current is not None:
+            self.playback_position_time = current
+            self.timeline.set_cursor_time(current)
+        self._update_playback_state_label()
+        return False
+
+    def _handle_playback_time_poll_error(self, message: str) -> bool:
+        self.playback_time_poll_pending = False
+        if self.playback_handle < 0:
+            return False
+        self._set_status(f"Playback time poll error: {message}")
+        return False
+
     def _on_playback_host_ready(self, xid: int) -> None:
         self.playback_host_xid = xid
         self._set_playback_info(f"Playback host ready. X11 window id={xid}")
@@ -550,10 +556,10 @@ class MainWindow(Gtk.Window):
         if handle < 0:
             return
         self.playback_handle = -1
+        self.playback_time_poll_pending = False
         self.playback_paused = False
         self.playback_speed_factor = 1.0
         self.playback_position_time = None
-        self.playback_position_mono = None
         self.active_archive_file = None
         self.active_archive_channel = None
         self._stop_playback_tick()
@@ -631,10 +637,10 @@ class MainWindow(Gtk.Window):
         if request_id is not None and request_id != self.playback_request_id:
             return False
         self.playback_handle = -1
+        self.playback_time_poll_pending = False
         self.playback_paused = False
         self.playback_speed_factor = 1.0
         self.playback_position_time = None
-        self.playback_position_mono = None
         self.active_archive_file = None
         self.active_archive_channel = None
         self._stop_playback_tick()
@@ -708,7 +714,6 @@ class MainWindow(Gtk.Window):
 
     def _handle_pause_done(self) -> bool:
         self.playback_paused = True
-        self.playback_position_mono = None
         self._update_playback_state_label()
         self._set_status("Playback paused")
         return False

@@ -30,6 +30,7 @@ from hikvision_player.sdk.device import (  # type: ignore  # noqa: E402
     ConnectionParams as QtConnectionParams,
     HikvisionDeviceService,
 )
+from hikvision_player.sdk.playctrl_native import PlayCtrl  # type: ignore  # noqa: E402
 from hikvision_player.sdk.playctr import NET_DVR_PLAYSTART  # type: ignore  # noqa: E402
 from hikvision_player.sdk.playctr import (  # type: ignore  # noqa: E402
     NET_DVR_PLAYFAST,
@@ -220,6 +221,14 @@ class NET_DVR_DIGITAL_CHANNEL_STATE(ctypes.Structure):
 
 
 @dataclass
+class PlaybackSessionState:
+    start_time: datetime
+    end_time: datetime
+    play_port: int | None = 0
+    last_system_time: datetime | None = None
+
+
+@dataclass
 class HikvisionPlugin:
     service: HikvisionDeviceService
     current_params: ConnectionParams | None = None
@@ -229,6 +238,31 @@ class HikvisionPlugin:
         self.service = HikvisionDeviceService()
         self.current_params = None
         self.last_report = None
+        self._playctrl: PlayCtrl | None = None
+        self._playback_sessions: dict[int, PlaybackSessionState] = {}
+
+    def _ensure_playctrl_loaded(self) -> bool:
+        if self._playctrl is not None:
+            return True
+        try:
+            self._playctrl = PlayCtrl()
+        except Exception:
+            self._playctrl = None
+        return self._playctrl is not None
+
+    def _probe_play_port(self, session: PlaybackSessionState) -> int | None:
+        if not self._ensure_playctrl_loaded() or self._playctrl is None:
+            return session.play_port
+        if session.play_port is None:
+            session.play_port = 0
+        size0 = self._playctrl.get_picture_size(session.play_port)
+        st0 = self._playctrl.get_system_time(session.play_port)
+        if size0 is not None or st0 is not None:
+            return session.play_port
+        port = self._playctrl.find_active_port()
+        if port is not None:
+            session.play_port = int(port)
+        return session.play_port
 
     def _missing_sdk_files(self) -> list[str]:
         return validate_sdk_layout(DEFAULT_LIB_DIR)
@@ -768,6 +802,12 @@ class HikvisionPlugin:
             error = self.service.last_error or "NET_DVR_PLAYSTART failed"
             self.service.stop_playback(handle)
             raise RuntimeError(error)
+        self._playback_sessions[int(handle)] = PlaybackSessionState(
+            start_time=start_time,
+            end_time=end_time,
+            play_port=0,
+            last_system_time=resume_time,
+        )
         return int(handle)
 
     def stop_archive_playback(self, handle: int) -> None:
@@ -775,6 +815,7 @@ class HikvisionPlugin:
             return
         self.ensure_connected()
         ok = self.service.stop_playback(handle)
+        self._playback_sessions.pop(int(handle), None)
         if not ok:
             raise RuntimeError(self.service.last_error or "stop_playback failed")
 
@@ -785,6 +826,9 @@ class HikvisionPlugin:
         ok = self.service.playback_set_time(handle, target_time)
         if not ok:
             raise RuntimeError(self.service.last_error or "playback_set_time failed")
+        session = self._playback_sessions.get(int(handle))
+        if session is not None:
+            session.last_system_time = target_time
 
     def pause_archive_playback(self, handle: int) -> None:
         if handle < 0:
@@ -844,6 +888,28 @@ class HikvisionPlugin:
         ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYFRAME, in_buffer=None, out_buffer=None)
         if not ok:
             raise RuntimeError(self.service.last_error or "NET_DVR_PLAYFRAME failed")
+
+    def get_archive_playback_time(self, handle: int) -> datetime | None:
+        if handle < 0:
+            return None
+        self.ensure_connected()
+        session = self._playback_sessions.get(int(handle))
+        if session is None:
+            return None
+        if not self._ensure_playctrl_loaded() or self._playctrl is None:
+            return session.last_system_time
+        port = self._probe_play_port(session)
+        if port is None:
+            return session.last_system_time
+        system_time = self._playctrl.get_system_time(int(port))
+        if system_time is None:
+            return session.last_system_time
+        if system_time < session.start_time:
+            system_time = session.start_time
+        if system_time > session.end_time:
+            system_time = session.end_time
+        session.last_system_time = system_time
+        return system_time
 
     def build_archive_coverage_report(
         self,

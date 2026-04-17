@@ -52,11 +52,11 @@
 
 Приоритет следующего этапа:
 
-- [ ] Добавить `pause / resume`
-- [ ] Добавить `speed control`
-- [ ] Добавить `frame step`
-- [ ] Обновлять позицию курсора timeline от текущего playback time
-- [ ] Явно показывать активный playback session/state на вкладке `Архив`
+- [x] Добавить `pause / resume`
+- [x] Добавить `speed control`
+- [x] Добавить `frame step`
+- [x] Обновлять позицию курсора timeline от текущего playback time
+- [x] Явно показывать активный playback session/state на вкладке `Архив`
 - [ ] Доработать diagnostic diff до отдельной таблицы по каналам
 - [ ] Разделить baseline и last-current-state в структуре конфига
 
