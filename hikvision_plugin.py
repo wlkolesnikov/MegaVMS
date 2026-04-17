@@ -1,0 +1,899 @@
+from __future__ import annotations
+
+import ctypes
+from dataclasses import dataclass
+from datetime import datetime, timedelta
+import math
+import os
+from pathlib import Path
+import sys
+
+from contracts import (
+    ArchiveCoverageReport,
+    ArchiveFile,
+    ArchiveSegment,
+    ChannelInfo,
+    ConnectionParams,
+    DiagnosticReport,
+    RuntimeConfig,
+)
+
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+QT_ROOT = REPO_ROOT / "sdk-hik-QT"
+if str(QT_ROOT) not in sys.path:
+    sys.path.insert(0, str(QT_ROOT))
+
+from hikvision_player.config import DEFAULT_LIB_DIR, validate_sdk_layout  # type: ignore  # noqa: E402
+
+from hikvision_player.sdk.device import (  # type: ignore  # noqa: E402
+    ConnectionParams as QtConnectionParams,
+    HikvisionDeviceService,
+)
+from hikvision_player.sdk.playctr import NET_DVR_PLAYSTART  # type: ignore  # noqa: E402
+from hikvision_player.sdk.playctr import (  # type: ignore  # noqa: E402
+    NET_DVR_PLAYFAST,
+    NET_DVR_PLAYFRAME,
+    NET_DVR_PLAYNORMAL,
+    NET_DVR_PLAYPAUSE,
+    NET_DVR_PLAYRESTART,
+    NET_DVR_PLAYSLOW,
+)
+from hikvision_sdk.exceptions import LoginError  # type: ignore  # noqa: E402
+
+
+NET_DVR_GET_IPPARACFG_V40 = 1062
+NAME_LEN = 32
+PASSWD_LEN = 16
+MAX_DOMAIN_NAME = 64
+MAX_CHANNUM_V30 = 64
+MAX_ANALOG_CHANNUM = 32
+MAX_IP_DEVICE_V40 = 64
+URL_LEN = 240
+STATUS_ONLINE = "ONLINE"
+STATUS_OFFLINE = "OFFLINE"
+STATUS_NO_VIDEO = "NO VIDEO"
+STATUS_DISABLED = "DISABLED"
+STATUS_UNKNOWN = "UNKNOWN"
+STATUS_CONNECTING = "CONNECTING"
+STATUS_ACCOUNT_ERROR = "ACCOUNT ERROR"
+STATUS_CHANNEL_ERROR = "CHANNEL ERROR"
+STATUS_NETWORK_ERROR = "NETWORK ERROR"
+STATUS_IPC_ERROR = "IPC ERROR"
+
+DIGITAL_STATUS_TEXT = {
+    1: (STATUS_ONLINE, True, True, ""),
+    2: (STATUS_CONNECTING, False, False, "Connecting"),
+    3: ("BANDWIDTH EXCEEDED", False, False, "Bandwidth exceeded"),
+    4: ("DOMAIN ERROR", False, False, "Domain error"),
+    5: (STATUS_CHANNEL_ERROR, False, False, "Invalid remote channel"),
+    6: (STATUS_ACCOUNT_ERROR, False, False, "Wrong username/password or account issue"),
+    7: ("STREAM TYPE ERROR", False, False, "Stream type not supported"),
+    8: ("DVR CONFLICT", False, False, "Conflict with DVR"),
+    9: ("IPC CONFLICT", False, False, "Conflict with IPC"),
+    10: (STATUS_NETWORK_ERROR, False, False, "Network unreachable"),
+    11: ("IPC NOT EXIST", False, False, "IPC not found"),
+    12: (STATUS_IPC_ERROR, False, False, "IPC exception"),
+    13: ("OTHER ERROR", False, False, "Other connection error"),
+    14: ("RESOLUTION ERROR", False, False, "Resolution not supported"),
+    15: ("IPC LAN ERROR", False, False, "IPC LAN error"),
+    16: ("USER LOCKED", False, False, "User locked"),
+    17: ("NOT ACTIVATED", False, False, "IPC not activated"),
+    18: ("USER NOT EXIST", False, False, "User does not exist"),
+    19: ("UNREGISTERED", False, False, "IPC unregistered"),
+    20: ("POE DETECTING", False, False, "PoE port detecting"),
+    21: ("RESOURCE EXCEEDED", False, False, "Resource exceeded"),
+    22: ("NEED REPAIR", False, False, "IPC needs repair"),
+    23: ("ACTIVATING", False, False, "IPC activating"),
+    24: ("TOKEN AUTH FAILED", False, False, "Token authentication failed"),
+}
+
+
+class NET_DVR_IPADDR(ctypes.Structure):
+    _fields_ = [
+        ("sIpV4", ctypes.c_char * 16),
+        ("byIPv6", ctypes.c_ubyte * 128),
+    ]
+
+
+class NET_DVR_IPDEVINFO_V31(ctypes.Structure):
+    _fields_ = [
+        ("byEnable", ctypes.c_ubyte),
+        ("byProType", ctypes.c_ubyte),
+        ("byEnableQuickAdd", ctypes.c_ubyte),
+        ("byCameraType", ctypes.c_ubyte),
+        ("sUserName", ctypes.c_ubyte * NAME_LEN),
+        ("sPassword", ctypes.c_ubyte * PASSWD_LEN),
+        ("byDomain", ctypes.c_ubyte * MAX_DOMAIN_NAME),
+        ("struIP", NET_DVR_IPADDR),
+        ("wDVRPort", ctypes.c_uint16),
+        ("szDeviceID", ctypes.c_ubyte * 32),
+        ("byEnableTiming", ctypes.c_ubyte),
+        ("byCertificateValidation", ctypes.c_ubyte),
+    ]
+
+
+class NET_DVR_IPCHANINFO(ctypes.Structure):
+    _fields_ = [
+        ("byEnable", ctypes.c_ubyte),
+        ("byIPID", ctypes.c_ubyte),
+        ("byChannel", ctypes.c_ubyte),
+        ("byIPIDHigh", ctypes.c_ubyte),
+        ("byTransProtocol", ctypes.c_ubyte),
+        ("byGetStream", ctypes.c_ubyte),
+        ("byRes", ctypes.c_ubyte * 30),
+    ]
+
+
+class NET_DVR_IPCHANINFO_V40(ctypes.Structure):
+    _fields_ = [
+        ("byEnable", ctypes.c_ubyte),
+        ("byRes1", ctypes.c_ubyte),
+        ("wIPID", ctypes.c_uint16),
+        ("dwChannel", ctypes.c_uint32),
+        ("byTransProtocol", ctypes.c_ubyte),
+        ("byTransMode", ctypes.c_ubyte),
+        ("byFactoryType", ctypes.c_ubyte),
+        ("byRes", ctypes.c_ubyte),
+        ("strURL", ctypes.c_ubyte * URL_LEN),
+    ]
+
+
+class NET_DVR_GET_STREAM_UNION(ctypes.Union):
+    _fields_ = [
+        ("struChanInfo", NET_DVR_IPCHANINFO),
+        ("struIPChan", NET_DVR_IPCHANINFO_V40),
+        ("byRaw", ctypes.c_ubyte * 492),
+    ]
+
+
+class NET_DVR_STREAM_MODE(ctypes.Structure):
+    _fields_ = [
+        ("byGetStreamType", ctypes.c_ubyte),
+        ("byRes", ctypes.c_ubyte * 3),
+        ("uGetStream", NET_DVR_GET_STREAM_UNION),
+    ]
+
+
+class NET_DVR_IPPARACFG_V40(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("dwGroupNum", ctypes.c_uint32),
+        ("dwAChanNum", ctypes.c_uint32),
+        ("dwDChanNum", ctypes.c_uint32),
+        ("dwStartDChan", ctypes.c_uint32),
+        ("byAnalogChanEnable", ctypes.c_ubyte * MAX_CHANNUM_V30),
+        ("struIPDevInfo", NET_DVR_IPDEVINFO_V31 * MAX_IP_DEVICE_V40),
+        ("struStreamMode", NET_DVR_STREAM_MODE * MAX_CHANNUM_V30),
+        ("byRes2", ctypes.c_ubyte * 20),
+    ]
+
+
+class NET_DVR_CHANNELSTATE_V30(ctypes.Structure):
+    _fields_ = [
+        ("byRecordStatic", ctypes.c_ubyte),
+        ("bySignalStatic", ctypes.c_ubyte),
+        ("byHardwareStatic", ctypes.c_ubyte),
+        ("byRes1", ctypes.c_ubyte),
+        ("dwBitRate", ctypes.c_uint32),
+        ("dwLinkNum", ctypes.c_uint32),
+        ("struClientIP", NET_DVR_IPADDR * 6),
+        ("dwIPLinkNum", ctypes.c_uint32),
+        ("byExceedMaxLink", ctypes.c_ubyte),
+        ("byRes", ctypes.c_ubyte * 3),
+        ("dwAllBitRate", ctypes.c_uint32),
+        ("dwChannelNo", ctypes.c_uint32),
+    ]
+
+
+class NET_DVR_DISKSTATE(ctypes.Structure):
+    _fields_ = [
+        ("dwVolume", ctypes.c_uint32),
+        ("dwFreeSpace", ctypes.c_uint32),
+        ("dwHardDiskStatic", ctypes.c_uint32),
+    ]
+
+
+class NET_DVR_WORKSTATE_V30(ctypes.Structure):
+    _fields_ = [
+        ("dwDeviceStatic", ctypes.c_uint32),
+        ("struHardDiskStatic", NET_DVR_DISKSTATE * 33),
+        ("struChanStatic", NET_DVR_CHANNELSTATE_V30 * MAX_CHANNUM_V30),
+        ("byAlarmInStatic", ctypes.c_ubyte * 160),
+        ("byAlarmOutStatic", ctypes.c_ubyte * 96),
+        ("dwLocalDisplay", ctypes.c_uint32),
+        ("byAudioChanStatus", ctypes.c_ubyte * 2),
+        ("byRes", ctypes.c_ubyte * 10),
+    ]
+
+
+class NET_DVR_DIGITAL_CHANNEL_STATE(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", ctypes.c_uint32),
+        ("byDigitalAudioChanTalkState", ctypes.c_ubyte * MAX_CHANNUM_V30),
+        ("byDigitalChanState", ctypes.c_ubyte * MAX_CHANNUM_V30),
+        ("byDigitalAudioChanTalkStateEx", ctypes.c_ubyte * (MAX_CHANNUM_V30 * 3)),
+        ("byDigitalChanStateEx", ctypes.c_ubyte * (MAX_CHANNUM_V30 * 3)),
+        ("byAnalogChanState", ctypes.c_ubyte * MAX_ANALOG_CHANNUM),
+        ("byRes", ctypes.c_ubyte * 32),
+    ]
+
+
+@dataclass
+class HikvisionPlugin:
+    service: HikvisionDeviceService
+    current_params: ConnectionParams | None = None
+    last_report: DiagnosticReport | None = None
+
+    def __init__(self) -> None:
+        self.service = HikvisionDeviceService()
+        self.current_params = None
+        self.last_report = None
+
+    def _missing_sdk_files(self) -> list[str]:
+        return validate_sdk_layout(DEFAULT_LIB_DIR)
+
+    def _demo_channels(self) -> list[ChannelInfo]:
+        return [
+            ChannelInfo(
+                number=item.number,
+                name=item.name,
+                kind=item.kind,
+                is_online=item.is_online,
+                configured=True,
+                enabled=True,
+                transport_online=item.is_online if item.kind == "ip" else None,
+                video_present=item.is_online,
+                status_text=STATUS_ONLINE if item.is_online else STATUS_OFFLINE,
+                error_code=None,
+                error_text="",
+            )
+            for item in self.service.channels()
+        ]
+
+    def _sdk_handles(self) -> tuple[object, int]:
+        if self.service.mode != "real" or self.service.device is None or self.service._sdk is None:  # type: ignore[attr-defined]
+            raise RuntimeError("Real SDK session is not available")
+        return self.service._sdk._sdk, int(self.service.device.user_id)  # type: ignore[attr-defined]
+
+    def _get_ipparacfg_v40(self) -> NET_DVR_IPPARACFG_V40 | None:
+        sdk, user_id = self._sdk_handles()
+        sdk.NET_DVR_GetDVRConfig.argtypes = [
+            ctypes.c_long,
+            ctypes.c_uint32,
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        sdk.NET_DVR_GetDVRConfig.restype = ctypes.c_bool
+
+        payload = NET_DVR_IPPARACFG_V40()
+        ctypes.memset(ctypes.byref(payload), 0, ctypes.sizeof(payload))
+        payload.dwSize = ctypes.sizeof(payload)
+        returned = ctypes.c_uint32(0)
+
+        last_error = None
+        for channel in (0, -1):
+            ok = sdk.NET_DVR_GetDVRConfig(
+                ctypes.c_long(user_id),
+                ctypes.c_uint32(NET_DVR_GET_IPPARACFG_V40),
+                ctypes.c_long(channel),
+                ctypes.byref(payload),
+                ctypes.c_uint32(ctypes.sizeof(payload)),
+                ctypes.byref(returned),
+            )
+            if ok:
+                return payload
+            if hasattr(sdk, "NET_DVR_GetLastError"):
+                last_error = int(sdk.NET_DVR_GetLastError())
+        if last_error is not None:
+            self.service._last_error = f"NET_DVR_GET_IPPARACFG_V40 failed: error={last_error}"  # type: ignore[attr-defined]
+        return None
+
+    def _get_work_state_v30(self) -> NET_DVR_WORKSTATE_V30 | None:
+        sdk, user_id = self._sdk_handles()
+        sdk.NET_DVR_GetDVRWorkState_V30.argtypes = [
+            ctypes.c_long,
+            ctypes.POINTER(NET_DVR_WORKSTATE_V30),
+        ]
+        sdk.NET_DVR_GetDVRWorkState_V30.restype = ctypes.c_bool
+
+        state = NET_DVR_WORKSTATE_V30()
+        ctypes.memset(ctypes.byref(state), 0, ctypes.sizeof(state))
+        ok = sdk.NET_DVR_GetDVRWorkState_V30(
+            ctypes.c_long(user_id),
+            ctypes.byref(state),
+        )
+        if not ok:
+            return None
+        return state
+
+    def _get_digital_channel_state(self) -> NET_DVR_DIGITAL_CHANNEL_STATE | None:
+        sdk, user_id = self._sdk_handles()
+        sdk.NET_DVR_GetDVRConfig.argtypes = [
+            ctypes.c_long,
+            ctypes.c_uint32,
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        sdk.NET_DVR_GetDVRConfig.restype = ctypes.c_bool
+
+        payload = NET_DVR_DIGITAL_CHANNEL_STATE()
+        ctypes.memset(ctypes.byref(payload), 0, ctypes.sizeof(payload))
+        payload.dwSize = ctypes.sizeof(payload)
+        returned = ctypes.c_uint32(0)
+        ok = sdk.NET_DVR_GetDVRConfig(
+            ctypes.c_long(user_id),
+            ctypes.c_uint32(6126),
+            ctypes.c_long(0),
+            ctypes.byref(payload),
+            ctypes.c_uint32(ctypes.sizeof(payload)),
+            ctypes.byref(returned),
+        )
+        if not ok:
+            return None
+        return payload
+
+    @staticmethod
+    def _analog_enabled(config: NET_DVR_IPPARACFG_V40 | None, analog_index: int) -> bool:
+        if config is None:
+            return True
+        if analog_index < 0 or analog_index >= MAX_ANALOG_CHANNUM:
+            return False
+        first_block = [int(config.byAnalogChanEnable[index]) for index in range(MAX_ANALOG_CHANNUM)]
+        if all(value in (0, 1) for value in first_block):
+            return bool(first_block[analog_index])
+        packed_value = int(config.byAnalogChanEnable[analog_index // 8])
+        return bool(packed_value & (1 << (analog_index % 8)))
+
+    @staticmethod
+    def _ip_slot_state(config: NET_DVR_IPPARACFG_V40 | None, channel_number: int) -> dict[str, bool | None]:
+        fallback = {
+            "configured": True,
+            "enabled": True,
+            "transport_online": None,
+            "video_present": None,
+        }
+        if config is None:
+            return fallback
+
+        start_dchan = int(config.dwStartDChan)
+        index = channel_number - start_dchan
+        if index < 0 or index >= MAX_CHANNUM_V30:
+            return {
+                "configured": False,
+                "enabled": False,
+                "transport_online": None,
+                "video_present": None,
+            }
+
+        stream_mode = config.struStreamMode[index]
+        stream_type = int(stream_mode.byGetStreamType)
+        if stream_type == 0:
+            chan_info = stream_mode.uGetStream.struChanInfo
+            device_id = int(chan_info.byIPID) + int(chan_info.byIPIDHigh) * 256
+            channel_ref = int(chan_info.byChannel)
+            transport_online = bool(chan_info.byEnable)
+        elif stream_type == 6:
+            chan_info_v40 = stream_mode.uGetStream.struIPChan
+            device_id = int(chan_info_v40.wIPID)
+            channel_ref = int(chan_info_v40.dwChannel)
+            transport_online = bool(chan_info_v40.byEnable)
+        else:
+            device_id = 0
+            channel_ref = 0
+            transport_online = None
+
+        configured = device_id > 0 and channel_ref > 0
+        if not configured:
+            return {
+                "configured": False,
+                "enabled": False,
+                "transport_online": None,
+                "video_present": None,
+            }
+
+        device_valid = False
+        if 1 <= device_id <= MAX_IP_DEVICE_V40:
+            device_valid = bool(config.struIPDevInfo[device_id - 1].byEnable)
+        enabled = device_valid or configured
+        return {
+            "configured": configured,
+            "enabled": enabled,
+            "transport_online": transport_online,
+            "video_present": transport_online,
+        }
+
+    @staticmethod
+    def _status_text(
+        *,
+        enabled: bool,
+        transport_online: bool | None,
+        video_present: bool | None,
+        kind: str,
+    ) -> str:
+        if not enabled:
+            return STATUS_DISABLED
+        if kind == "analog":
+            if video_present is False:
+                return STATUS_NO_VIDEO
+            if video_present is True:
+                return STATUS_ONLINE
+            return STATUS_UNKNOWN
+        if transport_online is True:
+            return STATUS_ONLINE
+        if transport_online is False:
+            return STATUS_OFFLINE
+        return STATUS_UNKNOWN
+
+    @staticmethod
+    def _decode_bytes(value: ctypes.Array[ctypes.c_ubyte] | ctypes.Array[ctypes.c_char] | bytes) -> str:
+        raw = bytes(value)
+        return raw.split(b"\x00", 1)[0].decode("utf-8", errors="ignore").strip()
+
+    def _get_ip_device_details(self, config: NET_DVR_IPPARACFG_V40 | None, channel_number: int) -> dict[str, str | int] | None:
+        if config is None:
+            return None
+        start_dchan = int(config.dwStartDChan)
+        index = channel_number - start_dchan
+        if index < 0 or index >= MAX_CHANNUM_V30:
+            return None
+        stream_mode = config.struStreamMode[index]
+        stream_type = int(stream_mode.byGetStreamType)
+        if stream_type == 0:
+            chan_info = stream_mode.uGetStream.struChanInfo
+            device_id = int(chan_info.byIPID) + int(chan_info.byIPIDHigh) * 256
+        elif stream_type == 6:
+            chan_info = stream_mode.uGetStream.struIPChan
+            device_id = int(chan_info.wIPID)
+        else:
+            return None
+        if device_id < 1 or device_id > MAX_IP_DEVICE_V40:
+            return None
+        device_info = config.struIPDevInfo[device_id - 1]
+        return {
+            "device_id": device_id,
+            "host": self._decode_bytes(device_info.struIP.sIpV4),
+            "port": int(device_info.wDVRPort) or 8000,
+            "username": self._decode_bytes(device_info.sUserName),
+            "password": self._decode_bytes(device_info.sPassword),
+        }
+
+    def _diagnose_ip_login(self, device_details: dict[str, str | int] | None) -> tuple[str, int | None, str]:
+        if not device_details:
+            return STATUS_OFFLINE, None, "Connection failed; device details are unavailable"
+        host = str(device_details.get("host", "")).strip()
+        username = str(device_details.get("username", "")).strip()
+        password = str(device_details.get("password", ""))
+        port = int(device_details.get("port", 8000))
+        if not host:
+            return STATUS_OFFLINE, None, "Connection failed; IPC address is empty"
+
+        import hikvision_sdk  # type: ignore
+
+        sdk = hikvision_sdk.HCNetSDK()
+        device = None
+        try:
+            sdk.init()
+            if hasattr(sdk, "_sdk") and hasattr(sdk._sdk, "NET_DVR_SetConnectTime"):
+                sdk._sdk.NET_DVR_SetConnectTime(1000, 1)
+            device = sdk.login(host, port, username, password)
+            return STATUS_ONLINE, None, ""
+        except LoginError as exc:
+            error_code = exc.error_code
+            if error_code == 1:
+                return STATUS_ACCOUNT_ERROR, error_code, "Wrong username/password"
+            if error_code == 44:
+                return STATUS_OFFLINE, error_code, "Device offline"
+            return STATUS_OFFLINE, error_code, str(exc)
+        except Exception as exc:
+            return STATUS_OFFLINE, None, str(exc)
+        finally:
+            try:
+                if device is not None:
+                    sdk.logout(device.user_id)
+            except Exception:
+                pass
+            try:
+                sdk.cleanup()
+            except Exception:
+                pass
+
+    @staticmethod
+    def _ip_error_state(digital_state: NET_DVR_DIGITAL_CHANNEL_STATE | None, channel_number: int, start_dchan: int) -> tuple[bool | None, bool | None, str, int | None, str]:
+        if digital_state is None:
+            return None, None, STATUS_UNKNOWN, None, ""
+        index = channel_number - start_dchan
+        if index < 0 or index >= MAX_CHANNUM_V30:
+            return None, None, STATUS_UNKNOWN, None, ""
+        code = int(digital_state.byDigitalChanState[index])
+        if code <= 0:
+            return None, None, STATUS_UNKNOWN, None, ""
+        status_text, transport_online, video_present, error_text = DIGITAL_STATUS_TEXT.get(
+            code,
+            (f"STATE {code}", False, False, "Unknown digital channel state"),
+        )
+        return transport_online, video_present, status_text, code, error_text
+
+    def _probe_channels(self, warnings: list[str] | None = None) -> list[ChannelInfo]:
+        if self.service.mode != "real" or self.service.device is None:
+            return self._demo_channels()
+
+        base_channels = self.service.channels()
+        config = None
+        work_state = None
+        digital_state = None
+
+        try:
+            config = self._get_ipparacfg_v40()
+            if config is None and warnings is not None:
+                warnings.append("IP channel configuration status is unavailable.")
+        except Exception as exc:
+            if warnings is not None:
+                warnings.append(f"IP channel status query failed: {exc}")
+
+        try:
+            work_state = self._get_work_state_v30()
+            if work_state is None and warnings is not None:
+                warnings.append("Analog channel work state is unavailable.")
+        except Exception as exc:
+            if warnings is not None:
+                warnings.append(f"Analog channel status query failed: {exc}")
+
+        try:
+            digital_state = self._get_digital_channel_state()
+            if digital_state is None and warnings is not None:
+                warnings.append("Digital channel state is unavailable.")
+        except Exception as exc:
+            if warnings is not None:
+                warnings.append(f"Digital channel state query failed: {exc}")
+
+        start_channel = int(getattr(self.service.device, "start_channel", 1))
+        start_dchan = int(config.dwStartDChan) if config is not None else start_channel
+        channels: list[ChannelInfo] = []
+        for item in base_channels:
+            if item.kind == "analog":
+                analog_index = item.number - start_channel
+                enabled = self._analog_enabled(config, analog_index)
+                signal_lost = None
+                if work_state is not None and 0 <= analog_index < MAX_CHANNUM_V30:
+                    signal_lost = bool(work_state.struChanStatic[analog_index].bySignalStatic)
+                video_present = None if signal_lost is None else not signal_lost
+                status_text = self._status_text(
+                    enabled=enabled,
+                    transport_online=None,
+                    video_present=video_present,
+                    kind=item.kind,
+                )
+                channels.append(
+                    ChannelInfo(
+                        number=item.number,
+                        name=item.name,
+                        kind=item.kind,
+                        is_online=bool(enabled and video_present is not False),
+                        configured=enabled,
+                        enabled=enabled,
+                        transport_online=None,
+                        video_present=video_present,
+                        status_text=status_text,
+                        error_code=None,
+                        error_text="",
+                    )
+                )
+                continue
+
+            slot_state = self._ip_slot_state(config, item.number)
+            transport_online = slot_state["transport_online"]
+            enabled = bool(slot_state["enabled"])
+            video_present = slot_state["video_present"]
+            error_code = None
+            error_text = ""
+            if bool(slot_state["configured"]):
+                detected_transport, detected_video, detected_status, detected_code, detected_error = self._ip_error_state(
+                    digital_state,
+                    item.number,
+                    start_dchan,
+                )
+                if detected_transport is not None:
+                    transport_online = detected_transport
+                if detected_video is not None:
+                    video_present = detected_video
+                status_text = detected_status
+                error_code = detected_code
+                error_text = detected_error
+                if status_text == STATUS_UNKNOWN:
+                    status_text = self._status_text(
+                        enabled=enabled,
+                        transport_online=transport_online,
+                        video_present=video_present,
+                        kind=item.kind,
+                    )
+                if transport_online is False and error_code is None:
+                    status_text, error_code, error_text = self._diagnose_ip_login(
+                        self._get_ip_device_details(config, item.number)
+                    )
+                    transport_online = status_text == STATUS_ONLINE
+                    video_present = transport_online
+            else:
+                status_text = STATUS_DISABLED
+            channels.append(
+                ChannelInfo(
+                    number=item.number,
+                    name=item.name,
+                    kind=item.kind,
+                    is_online=bool(transport_online is True),
+                    configured=bool(slot_state["configured"]),
+                    enabled=enabled,
+                    transport_online=transport_online,
+                    video_present=video_present,
+                    status_text=status_text,
+                    error_code=error_code,
+                    error_text=error_text,
+                )
+            )
+        return channels
+
+    def diagnose_and_connect(self, params: ConnectionParams) -> tuple[DiagnosticReport, RuntimeConfig]:
+        warnings: list[str] = []
+        error = ""
+        mode = "disconnected"
+        try:
+            mode = self.service.login(
+                QtConnectionParams(
+                    host=params.host,
+                    port=params.port,
+                    username=params.username,
+                    password=params.password,
+                ),
+                allow_demo_fallback=True,
+            )
+        except Exception as exc:
+            error = str(exc)
+
+        channels = self._probe_channels(warnings)
+
+        missing_sdk_files = self._missing_sdk_files()
+        if missing_sdk_files:
+            warnings.append(f"SDK layout incomplete under {DEFAULT_LIB_DIR}")
+        if mode == "demo":
+            warnings.append("Connected in demo mode; real SDK login did not succeed.")
+        if self.service.last_error:
+            warnings.append(self.service.last_error)
+
+        device_label = params.host
+        if self.service.device is not None:
+            serial = getattr(self.service.device, "serial_number", "") or getattr(self.service.device, "serial", "")
+            model = getattr(self.service.device, "model", "") or getattr(self.service.device, "device_model", "")
+            pretty = " ".join(part for part in (str(model).strip(), str(serial).strip()) if part)
+            if pretty:
+                device_label = pretty
+
+        generated_at = datetime.now().isoformat(timespec="seconds")
+        report = DiagnosticReport(
+            plugin_name="hikvision",
+            connected=self.service.connected,
+            mode=mode,
+            generated_at=generated_at,
+            device_label=device_label,
+            channels=channels,
+            missing_sdk_files=missing_sdk_files,
+            warnings=warnings,
+            error=error,
+        )
+
+        runtime_config = RuntimeConfig(
+            plugin_name="hikvision",
+            created_at=generated_at,
+            connection=params,
+            detected_mode=mode,
+            channels=channels,
+            diagnostics_summary=report.as_text(),
+        )
+        self.current_params = params
+        self.last_report = report
+        return report, runtime_config
+
+    def disconnect(self) -> None:
+        self.service.logout()
+
+    def ensure_connected(self) -> None:
+        if self.service.connected:
+            return
+        if self.current_params is None:
+            raise RuntimeError("No runtime config loaded")
+        self.service.login(
+            QtConnectionParams(
+                host=self.current_params.host,
+                port=self.current_params.port,
+                username=self.current_params.username,
+                password=self.current_params.password,
+            ),
+            allow_demo_fallback=True,
+        )
+
+    def list_channels(self) -> list[ChannelInfo]:
+        self.ensure_connected()
+        return self._probe_channels()
+
+    def list_archive_days(self, channel: int, year: int, month: int) -> set[int]:
+        self.ensure_connected()
+        return self.service.archive_days(channel, year, month)
+
+    def list_archive_files(self, channel: int, day: datetime) -> list[ArchiveFile]:
+        self.ensure_connected()
+        return [
+            ArchiveFile(
+                filename=item.filename,
+                start_time=item.start_time,
+                end_time=item.end_time,
+                size_bytes=item.size_bytes,
+            )
+            for item in self.service.find_files(channel, day)
+        ]
+
+    def list_archive_segments(self, channel: int, day: datetime) -> list[ArchiveSegment]:
+        return [
+            ArchiveSegment(
+                start_time=item.start_time,
+                end_time=item.end_time,
+                label=item.filename,
+            )
+            for item in self.list_archive_files(channel, day)
+        ]
+
+    def start_archive_playback(
+        self,
+        *,
+        channel: int,
+        start_time: datetime,
+        end_time: datetime,
+        resume_time: datetime,
+        window_id: int,
+    ) -> int:
+        self.ensure_connected()
+        handle = self.service.playback_by_time_hwnd(
+            channel=channel,
+            start_time=start_time,
+            end_time=end_time,
+            resume_time=resume_time,
+            hwnd=window_id,
+        )
+        if handle < 0:
+            raise RuntimeError(self.service.last_error or "playback_by_time_hwnd failed")
+        ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYSTART, in_buffer=None, out_buffer=None)
+        if not ok:
+            error = self.service.last_error or "NET_DVR_PLAYSTART failed"
+            self.service.stop_playback(handle)
+            raise RuntimeError(error)
+        return int(handle)
+
+    def stop_archive_playback(self, handle: int) -> None:
+        if handle < 0:
+            return
+        self.ensure_connected()
+        ok = self.service.stop_playback(handle)
+        if not ok:
+            raise RuntimeError(self.service.last_error or "stop_playback failed")
+
+    def seek_archive_playback(self, handle: int, target_time: datetime) -> None:
+        if handle < 0:
+            raise RuntimeError("Playback handle is not active")
+        self.ensure_connected()
+        ok = self.service.playback_set_time(handle, target_time)
+        if not ok:
+            raise RuntimeError(self.service.last_error or "playback_set_time failed")
+
+    def pause_archive_playback(self, handle: int) -> None:
+        if handle < 0:
+            raise RuntimeError("Playback handle is not active")
+        self.ensure_connected()
+        ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYPAUSE, in_buffer=None, out_buffer=None)
+        if not ok:
+            raise RuntimeError(self.service.last_error or "NET_DVR_PLAYPAUSE failed")
+
+    def resume_archive_playback(self, handle: int) -> None:
+        if handle < 0:
+            raise RuntimeError("Playback handle is not active")
+        self.ensure_connected()
+        ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYRESTART, in_buffer=None, out_buffer=None)
+        if not ok:
+            ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYSTART, in_buffer=None, out_buffer=None)
+        if not ok:
+            raise RuntimeError(self.service.last_error or "NET_DVR_PLAYRESTART failed")
+
+    def set_archive_playback_speed(self, handle: int, factor: float) -> None:
+        if handle < 0:
+            raise RuntimeError("Playback handle is not active")
+        self.ensure_connected()
+        try:
+            desired = float(factor)
+        except Exception:
+            desired = 1.0
+        if desired <= 0:
+            desired = 1.0
+
+        if desired == 1.0:
+            ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYNORMAL, in_buffer=None, out_buffer=None)
+            if not ok:
+                raise RuntimeError(self.service.last_error or "NET_DVR_PLAYNORMAL failed")
+            return
+
+        if desired > 1.0:
+            steps = max(int(round(math.log(desired, 2))), 0)
+            cmd = NET_DVR_PLAYFAST
+        else:
+            steps = max(int(round(math.log(1.0 / desired, 2))), 0)
+            cmd = NET_DVR_PLAYSLOW
+
+        ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYNORMAL, in_buffer=None, out_buffer=None)
+        if not ok:
+            raise RuntimeError(self.service.last_error or "NET_DVR_PLAYNORMAL failed")
+        for _ in range(steps):
+            ok, _ = self.service.playback_control_v40(handle, cmd, in_buffer=None, out_buffer=None)
+            if not ok:
+                raise RuntimeError(self.service.last_error or "Playback speed command failed")
+
+    def step_archive_playback_frame(self, handle: int) -> None:
+        if handle < 0:
+            raise RuntimeError("Playback handle is not active")
+        self.ensure_connected()
+        self.service.playback_control_v40(handle, NET_DVR_PLAYPAUSE, in_buffer=None, out_buffer=None)
+        ok, _ = self.service.playback_control_v40(handle, NET_DVR_PLAYFRAME, in_buffer=None, out_buffer=None)
+        if not ok:
+            raise RuntimeError(self.service.last_error or "NET_DVR_PLAYFRAME failed")
+
+    def build_archive_coverage_report(
+        self,
+        *,
+        channel: int,
+        period_start: datetime,
+        period_end: datetime,
+    ) -> ArchiveCoverageReport:
+        self.ensure_connected()
+        if period_end <= period_start:
+            raise ValueError("period_end must be greater than period_start")
+
+        day_cursor = period_start.replace(hour=0, minute=0, second=0, microsecond=0)
+        merged: list[tuple[datetime, datetime]] = []
+        segments: list[tuple[datetime, datetime]] = []
+        while day_cursor <= period_end:
+            for item in self.service.find_files(channel, day_cursor):
+                start = max(item.start_time, period_start)
+                end = min(item.end_time, period_end)
+                if end <= start:
+                    continue
+                segments.append((start, end))
+            day_cursor += timedelta(days=1)
+
+        for start, end in sorted(segments, key=lambda item: item[0]):
+            if not merged or start > merged[-1][1]:
+                merged.append((start, end))
+                continue
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+
+        covered_seconds = int(sum((end - start).total_seconds() for start, end in merged))
+        total_seconds = max(1, int((period_end - period_start).total_seconds()))
+        coverage_percent = covered_seconds / total_seconds * 100.0
+
+        gaps: list[tuple[datetime, datetime]] = []
+        gap_cursor = period_start
+        for start, end in merged:
+            if start > gap_cursor:
+                gaps.append((gap_cursor, start))
+            gap_cursor = max(gap_cursor, end)
+        if gap_cursor < period_end:
+            gaps.append((gap_cursor, period_end))
+
+        return ArchiveCoverageReport(
+            channel=channel,
+            period_start=period_start,
+            period_end=period_end,
+            total_seconds=total_seconds,
+            covered_seconds=covered_seconds,
+            coverage_percent=coverage_percent,
+            segment_count=len(merged),
+            gaps=gaps,
+        )
