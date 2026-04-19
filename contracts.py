@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from typing import Any
 
@@ -11,6 +11,75 @@ class ConnectionParams:
     port: int
     username: str
     password: str
+
+
+@dataclass(frozen=True)
+class VideoHostBinding:
+    window_id: int
+    width: int
+    height: int
+
+
+@dataclass(frozen=True)
+class StreamProfile:
+    id: str
+    label: str
+    stream_type: int
+    is_low_res: bool = False
+
+
+@dataclass(frozen=True)
+class ZoomState:
+    x: float  # relative 0..1
+    y: float  # relative 0..1
+    width: float  # relative 0..1
+    height: float  # relative 0..1
+
+
+@dataclass(frozen=True)
+class PluginCapabilities:
+    supports_live: bool = False
+    supports_archive: bool = False
+    supports_native_surface_binding: bool = False
+    supports_grid_low_res_profile: bool = False
+    supports_profile_switch: bool = False
+    supports_archive_seek: bool = False
+    supports_rate_control: bool = False
+    supports_frame_step: bool = False
+    supports_native_zoom: bool = False
+    supports_snapshot: bool = False
+    supports_diagnostics: bool = False
+    supports_archive_coverage_report: bool = False
+
+
+LIVE_PROFILE_MAIN = StreamProfile(
+    id="main",
+    label="Main stream",
+    stream_type=0,
+    is_low_res=False,
+)
+
+
+LIVE_PROFILE_SUB = StreamProfile(
+    id="sub",
+    label="Sub stream",
+    stream_type=1,
+    is_low_res=True,
+)
+
+
+LIVE_PROFILES = (
+    LIVE_PROFILE_MAIN,
+    LIVE_PROFILE_SUB,
+)
+
+
+def resolve_live_profile(profile_id: str) -> StreamProfile:
+    normalized = str(profile_id).strip().lower()
+    for profile in LIVE_PROFILES:
+        if profile.id == normalized:
+            return profile
+    return LIVE_PROFILE_MAIN
 
 
 @dataclass(frozen=True)
@@ -64,10 +133,15 @@ class RuntimeConfig:
     created_at: str
     connection: ConnectionParams
     detected_mode: str
-    channels: list[ChannelInfo]
-    diagnostics_summary: str
+    baseline_channels: list[ChannelInfo] = field(default_factory=list)
+    current_channels: list[ChannelInfo] = field(default_factory=list)
+    diagnostics_summary: str = ""
     last_diagnostic_at: str = ""
     last_diagnostic_summary: str = ""
+
+    @property
+    def channels(self) -> list[ChannelInfo]:
+        return self.baseline_channels
 
 
 @dataclass(frozen=True)
@@ -147,26 +221,28 @@ class ArchiveCoverageReport:
 
 
 def runtime_config_to_dict(config: RuntimeConfig) -> dict[str, Any]:
-    return asdict(config)
+    return {
+        "plugin_name": config.plugin_name,
+        "created_at": config.created_at,
+        "connection": asdict(config.connection),
+        "detected_mode": config.detected_mode,
+        "baseline_channels": [asdict(channel) for channel in config.baseline_channels],
+        "current_channels": [asdict(channel) for channel in config.current_channels],
+        "channels": [asdict(channel) for channel in config.baseline_channels],
+        "diagnostics_summary": config.diagnostics_summary,
+        "last_diagnostic_at": config.last_diagnostic_at,
+        "last_diagnostic_summary": config.last_diagnostic_summary,
+    }
 
 
-def runtime_config_from_dict(payload: dict[str, Any]) -> RuntimeConfig:
-    connection_payload = payload.get("connection", {}) if isinstance(payload, dict) else {}
-    channels_payload = payload.get("channels", []) if isinstance(payload, dict) else []
-    return RuntimeConfig(
-        plugin_name=str(payload.get("plugin_name", "hikvision")) if isinstance(payload, dict) else "hikvision",
-        created_at=str(payload.get("created_at", datetime.now().isoformat(timespec="seconds"))),
-        connection=ConnectionParams(
-            host=str(connection_payload.get("host", "192.168.0.10")),
-            port=int(connection_payload.get("port", 8000)),
-            username=str(connection_payload.get("username", "admin")),
-            password=str(connection_payload.get("password", "")),
-        ),
-        detected_mode=str(payload.get("detected_mode", "disconnected")),
-        diagnostics_summary=str(payload.get("diagnostics_summary", "")),
-        last_diagnostic_at=str(payload.get("last_diagnostic_at", "")),
-        last_diagnostic_summary=str(payload.get("last_diagnostic_summary", "")),
-        channels=[
+def _channel_info_list_from_payload(payload: Any) -> list[ChannelInfo]:
+    if not isinstance(payload, list):
+        return []
+    result: list[ChannelInfo] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        result.append(
             ChannelInfo(
                 number=int(item.get("number", 0)),
                 name=str(item.get("name", "")),
@@ -197,7 +273,30 @@ def runtime_config_from_dict(payload: dict[str, Any]) -> RuntimeConfig:
                 ),
                 error_text=str(item.get("error_text", "")),
             )
-            for item in channels_payload
-            if isinstance(item, dict)
-        ],
+        )
+    return result
+
+
+def runtime_config_from_dict(payload: dict[str, Any]) -> RuntimeConfig:
+    connection_payload = payload.get("connection", {}) if isinstance(payload, dict) else {}
+    baseline_payload = payload.get("baseline_channels")
+    current_payload = payload.get("current_channels")
+    channels_payload = payload.get("channels", []) if isinstance(payload, dict) else []
+    baseline_channels = _channel_info_list_from_payload(baseline_payload if baseline_payload is not None else channels_payload)
+    current_channels = _channel_info_list_from_payload(current_payload if current_payload is not None else channels_payload)
+    return RuntimeConfig(
+        plugin_name=str(payload.get("plugin_name", "hikvision")) if isinstance(payload, dict) else "hikvision",
+        created_at=str(payload.get("created_at", datetime.now().isoformat(timespec="seconds"))),
+        connection=ConnectionParams(
+            host=str(connection_payload.get("host", "192.168.0.10")),
+            port=int(connection_payload.get("port", 8000)),
+            username=str(connection_payload.get("username", "admin")),
+            password=str(connection_payload.get("password", "")),
+        ),
+        detected_mode=str(payload.get("detected_mode", "disconnected")),
+        baseline_channels=baseline_channels,
+        current_channels=current_channels,
+        diagnostics_summary=str(payload.get("diagnostics_summary", "")) if isinstance(payload, dict) else "",
+        last_diagnostic_at=str(payload.get("last_diagnostic_at", "")) if isinstance(payload, dict) else "",
+        last_diagnostic_summary=str(payload.get("last_diagnostic_summary", "")) if isinstance(payload, dict) else "",
     )

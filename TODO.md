@@ -57,12 +57,17 @@
 - [x] Добавить `frame step`
 - [x] Обновлять позицию курсора timeline от текущего playback time
 - [x] Явно показывать активный playback session/state на вкладке `Архив`
-- [ ] Доработать diagnostic diff до отдельной таблицы по каналам
-- [ ] Разделить baseline и last-current-state в структуре конфига
+- [x] Добавить SDK-driven resize видео при изменении размера окна
+- [x] Добавить digital crop/zoom через SDK
+- [x] Добавить drag-and-drop pan и mouse-wheel zoom
+- [x] Добавить capability checks для zoom/pan функций
+- [x] Доработать diagnostic diff до отдельной таблицы по каналам
+- [x] Разделить baseline и last-current-state в структуре конфига
 
 ## Deferred
 
-- [ ] Live mode
-- [ ] Live grid low-res / fullscreen high-res switching
+- [x] Live mode (basic live preview support added; channel selector on Online tab)
+- [x] Live grid low-res / focus high-res switching
+- [ ] Fullscreen transition for focus mode
 - [ ] Snapshot mode for grid
 - [ ] Multi-vendor second plugin

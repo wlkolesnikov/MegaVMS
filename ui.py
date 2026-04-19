@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 import gi
@@ -17,23 +18,59 @@ try:
 except ImportError:  # pragma: no cover
     GdkX11 = None
 
-from contracts import ArchiveCoverageReport, ArchiveFile, ChannelInfo, ConnectionParams, DiagnosticState, RuntimeConfig
+from contracts import (
+    ArchiveCoverageReport,
+    ArchiveFile,
+    ChannelInfo,
+    ConnectionParams,
+    DiagnosticState,
+    RuntimeConfig,
+    VideoHostBinding,
+    ZoomState,
+    LIVE_PROFILE_MAIN,
+    LIVE_PROFILE_SUB,
+)
 from core import ApplicationCore
 from timeline import ArchiveTimelineWidget
 
 
 class X11VideoHost(Gtk.EventBox):
-    def __init__(self, *, on_ready, on_resize) -> None:
+    def __init__(
+        self,
+        *,
+        on_ready,
+        on_resize,
+        on_drag_start=None,
+        on_drag_motion=None,
+        on_drag_end=None,
+        on_zoom_wheel=None,
+        on_click=None,
+    ) -> None:
         super().__init__()
         self._on_ready = on_ready
         self._on_resize = on_resize
+        self._on_drag_start = on_drag_start
+        self._on_drag_motion = on_drag_motion
+        self._on_drag_end = on_drag_end
+        self._on_zoom_wheel = on_zoom_wheel
+        self._on_click = on_click
         self._xid = 0
         self.set_visible_window(True)
         self.set_size_request(960, 540)
         self.set_hexpand(True)
         self.set_vexpand(True)
+        self.set_events(
+            Gdk.EventMask.BUTTON_PRESS_MASK
+            | Gdk.EventMask.BUTTON_RELEASE_MASK
+            | Gdk.EventMask.POINTER_MOTION_MASK
+            | Gdk.EventMask.SCROLL_MASK
+        )
         self.connect("realize", self._handle_realize)
         self.connect("size-allocate", self._handle_size_allocate)
+        self.connect("button-press-event", self._handle_button_press)
+        self.connect("button-release-event", self._handle_button_release)
+        self.connect("motion-notify-event", self._handle_motion_notify)
+        self.connect("scroll-event", self._handle_scroll)
 
     @property
     def xid(self) -> int:
@@ -62,6 +99,49 @@ class X11VideoHost(Gtk.EventBox):
         if self._xid > 0 and allocation.width > 0 and allocation.height > 0:
             self._on_resize(self._xid, allocation.width, allocation.height)
 
+    def _handle_button_press(self, widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if event.button == 1 and self._on_click:
+            self._on_click(event)
+        if event.button == 1 and self._on_drag_start:  # Left button
+            self._on_drag_start(event.x, event.y)
+        return True
+
+    def _handle_button_release(self, widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
+        if event.button == 1 and self._on_drag_end:
+            self._on_drag_end(event.x, event.y)
+        return True
+
+    def _handle_motion_notify(self, widget: Gtk.Widget, event: Gdk.EventMotion) -> bool:
+        if self._on_drag_motion and event.state & Gdk.ModifierType.BUTTON1_MASK:
+            self._on_drag_motion(event.x, event.y)
+        return True
+
+    def _handle_scroll(self, widget: Gtk.Widget, event: Gdk.EventScroll) -> bool:
+        if self._on_zoom_wheel:
+            if event.direction == Gdk.ScrollDirection.UP:
+                direction = -1
+            elif event.direction == Gdk.ScrollDirection.DOWN:
+                direction = 1
+            elif event.direction == Gdk.ScrollDirection.SMOOTH:
+                direction = -1 if event.delta_y < 0 else 1
+            else:
+                direction = 1
+            self._on_zoom_wheel(event.x, event.y, direction)
+        return True
+
+
+@dataclass
+class LiveGridCellState:
+    index: int
+    frame: Gtk.Frame
+    host: X11VideoHost
+    title_label: Gtk.Label
+    status_label: Gtk.Label
+    expand_button: Gtk.Button
+    xid: int = 0
+    channel: int | None = None
+    handle: int = -1
+
 
 class MainWindow(Gtk.Window):
     DIAGNOSTIC_INTERVAL_SECONDS = 600
@@ -70,7 +150,11 @@ class MainWindow(Gtk.Window):
         super().__init__(title="SDK-HIK GTK Phase 1")
         self.core = core
         self.current_runtime_config: RuntimeConfig | None = self.core.runtime_config
-        self.current_channels: list[ChannelInfo] = list(self.current_runtime_config.channels) if self.current_runtime_config else []
+        self.current_channels: list[ChannelInfo] = (
+            list(self.current_runtime_config.current_channels or self.current_runtime_config.channels)
+            if self.current_runtime_config
+            else []
+        )
         self.current_files: list[ArchiveFile] = []
         self._syncing_channel_selection = False
         self._suppress_file_selection = False
@@ -80,11 +164,27 @@ class MainWindow(Gtk.Window):
         self.playback_host_xid = 0
         self.active_archive_channel: int | None = None
         self.active_archive_file: ArchiveFile | None = None
+        self.live_handle = -1
+        self.live_request_id = 0
+        self.live_host_xid = 0
+        self.active_live_channel: int | None = None
+        self.selected_live_channel: int | None = None
+        self.pending_live_focus_channel: int | None = None
+        self.live_view_mode = "grid"
+        self.live_grid_enabled = False
+        self.live_grid_generation = 0
+        self.live_grid_cells: list[LiveGridCellState] = []
         self.playback_paused = False
         self.playback_speed_factor = 1.0
         self.playback_position_time: datetime | None = None
         self.playback_tick_source_id = 0
         self.playback_time_poll_pending = False
+        self._current_zoom = ZoomState(0.0, 0.0, 1.0, 1.0)
+        self._dragging = False
+        self._drag_start_x = 0.0
+        self._drag_start_y = 0.0
+        self._zoom_start_x = 0.0
+        self._zoom_start_y = 0.0
 
         self.set_default_size(1380, 920)
         self.connect("destroy", self._on_destroy)
@@ -115,46 +215,466 @@ class MainWindow(Gtk.Window):
         self.show_all()
 
     def _build_online_tab(self) -> Gtk.Widget:
-        outer = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        outer.set_border_width(8)
 
-        left_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        left_box.set_border_width(8)
-        outer.pack1(left_box, resize=True, shrink=False)
+        toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        outer.pack_start(toolbar, False, False, 0)
 
-        playback_frame = Gtk.Frame(label="Live Surface")
-        playback_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        playback_box.set_border_width(8)
-        playback_box.pack_start(
-            Gtk.Label(
-                label="Онлайн-режим будет реализован следующим этапом.\n"
-                "Вкладка уже выделена отдельно под grid / focus / live controls.",
-                xalign=0.0,
-            ),
-            False,
-            False,
-            0,
+        self.live_grid_start_button = Gtk.Button(label="Start Live")
+        self.live_grid_start_button.connect("clicked", self._on_start_live_grid)
+        toolbar.pack_start(self.live_grid_start_button, False, False, 0)
+
+        self.live_grid_stop_button = Gtk.Button(label="Stop Live")
+        self.live_grid_stop_button.connect("clicked", self._on_stop_live_grid)
+        toolbar.pack_start(self.live_grid_stop_button, False, False, 0)
+
+        self.live_start_button = Gtk.Button(label="Focus Selected")
+        self.live_start_button.connect("clicked", self._on_start_live)
+        toolbar.pack_start(self.live_start_button, False, False, 0)
+
+        self.live_stop_button = Gtk.Button(label="Back To Grid")
+        self.live_stop_button.connect("clicked", self._on_stop_live)
+        toolbar.pack_start(self.live_stop_button, False, False, 0)
+
+        self.live_layout_label = Gtk.Label(label="Layout: 2x2", xalign=0.0)
+        toolbar.pack_start(self.live_layout_label, False, False, 12)
+
+        self.live_mode_label = Gtk.Label(label="Mode: Grid", xalign=0.0)
+        toolbar.pack_start(self.live_mode_label, False, False, 0)
+
+        self.live_toolbar_status_label = Gtk.Label(label="Live idle", xalign=1.0)
+        self.live_toolbar_status_label.set_hexpand(True)
+        self.live_toolbar_status_label.set_line_wrap(True)
+        toolbar.pack_start(self.live_toolbar_status_label, True, True, 0)
+
+        self.live_stack = Gtk.Stack()
+        self.live_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        self.live_stack.set_transition_duration(180)
+        self.live_stack.add_named(self._build_live_grid_view(), "grid")
+        self.live_stack.add_named(self._build_live_focus_view(), "focus")
+        outer.pack_start(self.live_stack, True, True, 0)
+
+        self._set_live_view_mode("grid")
+        self._refresh_live_grid_assignments()
+        return outer
+
+    def _build_live_grid_view(self) -> Gtk.Widget:
+        frame = Gtk.Frame(label="Live Grid")
+        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        container.set_border_width(8)
+        frame.add(container)
+
+        tile_grid = Gtk.Grid(column_spacing=10, row_spacing=10)
+        tile_grid.set_hexpand(True)
+        tile_grid.set_vexpand(True)
+        container.pack_start(tile_grid, True, True, 0)
+
+        self.live_grid_cells = []
+        for index in range(4):
+            cell_frame = Gtk.Frame()
+            cell_frame.set_hexpand(True)
+            cell_frame.set_vexpand(True)
+
+            overlay = Gtk.Overlay()
+            cell_frame.add(overlay)
+
+            host = X11VideoHost(
+                on_ready=lambda xid, cell_index=index: self._on_live_grid_host_ready(cell_index, xid),
+                on_resize=lambda _xid, width, height, cell_index=index: self._on_live_grid_host_resize(cell_index, width, height),
+                on_click=lambda event, cell_index=index: self._on_live_grid_tile_click(cell_index, event),
+            )
+            host.set_size_request(420, 236)
+            overlay.add(host)
+
+            header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+            header.set_halign(Gtk.Align.FILL)
+            header.set_valign(Gtk.Align.START)
+            header.set_margin_top(8)
+            header.set_margin_start(8)
+            header.set_margin_end(8)
+            overlay.add_overlay(header)
+
+            title_label = Gtk.Label(label=f"Slot {index + 1}", xalign=0.0)
+            title_label.set_halign(Gtk.Align.START)
+            title_label.set_line_wrap(True)
+            header.pack_start(title_label, True, True, 0)
+
+            expand_button = Gtk.Button(label="Expand")
+            expand_button.connect("clicked", lambda _button, cell_index=index: self._on_focus_grid_cell(cell_index))
+            header.pack_end(expand_button, False, False, 0)
+
+            status_label = Gtk.Label(label="Idle slot", xalign=0.0)
+            status_label.set_halign(Gtk.Align.START)
+            status_label.set_valign(Gtk.Align.END)
+            status_label.set_margin_start(8)
+            status_label.set_margin_end(8)
+            status_label.set_margin_bottom(8)
+            status_label.set_line_wrap(True)
+            overlay.add_overlay(status_label)
+
+            tile_grid.attach(cell_frame, index % 2, index // 2, 1, 1)
+            self.live_grid_cells.append(
+                LiveGridCellState(
+                    index=index,
+                    frame=cell_frame,
+                    host=host,
+                    title_label=title_label,
+                    status_label=status_label,
+                    expand_button=expand_button,
+                )
+            )
+        return frame
+
+    def _build_live_focus_view(self) -> Gtk.Widget:
+        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+
+        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        container.pack_start(header, False, False, 0)
+
+        self.live_back_button = Gtk.Button(label="Back To Grid")
+        self.live_back_button.connect("clicked", self._on_stop_live)
+        header.pack_start(self.live_back_button, False, False, 0)
+
+        self.live_focus_camera_label = Gtk.Label(label="No camera selected", xalign=0.0)
+        header.pack_start(self.live_focus_camera_label, False, False, 0)
+
+        self.live_focus_profile_label = Gtk.Label(label="Profile: Main stream", xalign=0.0)
+        header.pack_start(self.live_focus_profile_label, False, False, 12)
+
+        focus_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
+        container.pack_start(focus_paned, True, True, 0)
+
+        focus_frame = Gtk.Frame(label="Focus View")
+        focus_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        focus_box.set_border_width(8)
+        focus_frame.add(focus_box)
+
+        self.live_video_host = X11VideoHost(
+            on_ready=self._on_live_host_ready,
+            on_resize=self._on_live_host_resize,
         )
-        playback_frame.add(playback_box)
-        left_box.pack_start(playback_frame, True, True, 0)
+        focus_box.pack_start(self.live_video_host, True, True, 0)
 
-        right_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-        right_box.set_border_width(8)
-        outer.pack2(right_box, resize=False, shrink=False)
+        self.live_status_label = Gtk.Label(
+            label="Live focus is not started.",
+            xalign=0.0,
+        )
+        self.live_status_label.set_line_wrap(True)
+        focus_box.pack_start(self.live_status_label, False, False, 0)
+        focus_paned.pack1(focus_frame, resize=True, shrink=False)
 
-        self.online_status_store = Gtk.ListStore(int, str, str, str)
-        self.online_status_tree = Gtk.TreeView(model=self.online_status_store)
-        for index, title in enumerate(("Channel", "Name", "Kind", "Status")):
+        sidebar_frame = Gtk.Frame(label="Cameras")
+        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        sidebar_box.set_border_width(8)
+        sidebar_frame.add(sidebar_box)
+
+        self.live_sidebar_store = Gtk.ListStore(int, str, str)
+        self.live_sidebar_tree = Gtk.TreeView(model=self.live_sidebar_store)
+        self.live_sidebar_tree.get_selection().connect("changed", self._on_live_sidebar_selection_changed)
+        self.live_sidebar_tree.connect("row-activated", self._on_live_sidebar_row_activated)
+        for index, title in enumerate(("Channel", "Name", "Status")):
             renderer = Gtk.CellRendererText()
             column = Gtk.TreeViewColumn(title, renderer, text=index)
             column.set_resizable(True)
-            self.online_status_tree.append_column(column)
+            self.live_sidebar_tree.append_column(column)
+        sidebar_scroll = Gtk.ScrolledWindow()
+        sidebar_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        sidebar_scroll.set_min_content_width(300)
+        sidebar_scroll.add(self.live_sidebar_tree)
+        sidebar_box.pack_start(sidebar_scroll, True, True, 0)
 
-        scroll = Gtk.ScrolledWindow()
-        scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        scroll.set_min_content_width(360)
-        scroll.add(self.online_status_tree)
-        right_box.pack_start(scroll, True, True, 0)
-        return outer
+        self.live_sidebar_hint_label = Gtk.Label(
+            label="Double-click a camera in grid or sidebar to open focus.",
+            xalign=0.0,
+        )
+        self.live_sidebar_hint_label.set_line_wrap(True)
+        sidebar_box.pack_start(self.live_sidebar_hint_label, False, False, 0)
+        focus_paned.pack2(sidebar_frame, resize=False, shrink=False)
+
+        return container
+
+    @staticmethod
+    def _host_binding(host: X11VideoHost, xid: int) -> VideoHostBinding:
+        allocation = host.get_allocation()
+        return VideoHostBinding(
+            window_id=xid,
+            width=max(int(allocation.width), 0),
+            height=max(int(allocation.height), 0),
+        )
+
+    def _grid_profile(self):
+        capabilities = self.core.get_capabilities()
+        if capabilities.supports_grid_low_res_profile:
+            return LIVE_PROFILE_SUB
+        return LIVE_PROFILE_MAIN
+
+    @staticmethod
+    def _focus_profile():
+        return LIVE_PROFILE_MAIN
+
+    def _set_live_view_mode(self, mode: str) -> None:
+        self.live_view_mode = mode if mode in {"grid", "focus"} else "grid"
+        if hasattr(self, "live_stack"):
+            self.live_stack.set_visible_child_name(self.live_view_mode)
+
+    def _find_live_grid_cell(self, channel: int) -> LiveGridCellState | None:
+        for cell in self.live_grid_cells:
+            if cell.channel == channel:
+                return cell
+        return None
+
+    def _live_grid_has_active_sessions(self) -> bool:
+        return any(cell.handle >= 0 for cell in self.live_grid_cells)
+
+    def _has_active_live(self) -> bool:
+        return self.live_handle >= 0 or self._live_grid_has_active_sessions()
+
+    def _refresh_live_sidebar_store(self) -> None:
+        if not hasattr(self, "live_sidebar_store"):
+            return
+        self.live_sidebar_store.clear()
+        for channel in self.current_channels:
+            self.live_sidebar_store.append([channel.number, channel.name, channel.status_text])
+        self._sync_live_sidebar_selection()
+
+    def _sync_live_sidebar_selection(self) -> None:
+        if not hasattr(self, "live_sidebar_tree"):
+            return
+        selection = self.live_sidebar_tree.get_selection()
+        if self.selected_live_channel is None:
+            selection.unselect_all()
+            return
+        model = self.live_sidebar_store
+        treeiter = model.get_iter_first()
+        while treeiter is not None:
+            if model[treeiter][0] == self.selected_live_channel:
+                selection.select_iter(treeiter)
+                self.live_sidebar_tree.scroll_to_cell(model.get_path(treeiter), None, True, 0.4, 0.0)
+                return
+            treeiter = model.iter_next(treeiter)
+        selection.unselect_all()
+
+    def _select_live_channel(self, channel: int | None) -> None:
+        valid_numbers = {item.number for item in self.current_channels}
+        self.selected_live_channel = channel if channel in valid_numbers else None
+        if self.selected_live_channel is None and self.current_channels:
+            self.selected_live_channel = self.current_channels[0].number
+        self._sync_live_sidebar_selection()
+        self._refresh_live_controls()
+
+    def _selected_live_channel_info(self) -> ChannelInfo | None:
+        channel_id = self._try_selected_live_channel()
+        if channel_id is None:
+            return None
+        for channel in self.current_channels:
+            if channel.number == channel_id:
+                return channel
+        return None
+
+    def _refresh_live_grid_assignments(self) -> None:
+        for index, cell in enumerate(self.live_grid_cells):
+            assigned = self.current_channels[index] if index < len(self.current_channels) else None
+            assigned_number = assigned.number if assigned is not None else None
+            if cell.handle >= 0 and cell.channel != assigned_number:
+                self._request_stop_live_grid_cell(cell)
+            cell.channel = assigned_number
+            if assigned is None:
+                cell.title_label.set_text(f"Slot {index + 1}")
+                cell.status_label.set_text("Idle slot")
+                cell.expand_button.set_sensitive(False)
+                cell.frame.set_shadow_type(Gtk.ShadowType.OUT)
+                continue
+            cell.title_label.set_text(f"CH {assigned.number} | {assigned.name}")
+            status_text = assigned.status_text
+            if self.active_live_channel == assigned.number and self.live_handle >= 0:
+                cell.status_label.set_text(f"Focus active | {status_text}")
+            elif cell.handle >= 0:
+                cell.status_label.set_text(f"Live grid active | {status_text}")
+            elif self.live_grid_enabled:
+                cell.status_label.set_text(f"Starting stream | {status_text}")
+            else:
+                cell.status_label.set_text(status_text)
+            cell.expand_button.set_sensitive(self.live_host_xid > 0)
+            is_selected = self.selected_live_channel == assigned.number
+            cell.frame.set_shadow_type(Gtk.ShadowType.IN if is_selected else Gtk.ShadowType.OUT)
+
+    def _refresh_live_controls(self) -> None:
+        supports_live = self.core.get_capabilities().supports_live
+        grid_ready = any(cell.xid > 0 and cell.channel is not None for cell in self.live_grid_cells)
+        focus_ready = self.live_host_xid > 0
+        self.live_grid_start_button.set_sensitive(supports_live and grid_ready and not self.live_grid_enabled)
+        self.live_grid_stop_button.set_sensitive(supports_live and (self.live_grid_enabled or self._live_grid_has_active_sessions()))
+        self.live_start_button.set_sensitive(supports_live and focus_ready and self._try_selected_live_channel() is not None)
+        self.live_stop_button.set_sensitive(self.live_handle >= 0)
+        for cell in self.live_grid_cells:
+            cell.expand_button.set_sensitive(supports_live and focus_ready and cell.channel is not None)
+        selected_info = self._selected_live_channel_info()
+        selected_text = "no camera selected"
+        if selected_info is not None:
+            selected_text = f"selected CH {selected_info.number}: {selected_info.name}"
+        active_grid = sum(1 for cell in self.live_grid_cells if cell.handle >= 0)
+        if self.live_handle >= 0 and self.active_live_channel is not None:
+            self.live_mode_label.set_text("Mode: Focus")
+            self.live_toolbar_status_label.set_text(f"Focus active on channel {self.active_live_channel}; grid sessions {active_grid}")
+        elif self.live_view_mode == "focus" and self.pending_live_focus_channel is not None:
+            self.live_mode_label.set_text("Mode: Focus")
+            self.live_toolbar_status_label.set_text(f"Preparing focus for channel {self.pending_live_focus_channel}")
+        elif self.live_grid_enabled:
+            self.live_mode_label.set_text("Mode: Grid")
+            self.live_toolbar_status_label.set_text(f"Grid active: {active_grid} sessions, {selected_text}")
+        else:
+            self.live_mode_label.set_text("Mode: Grid")
+            self.live_toolbar_status_label.set_text(f"Live idle, {selected_text}")
+        if hasattr(self, "live_focus_camera_label"):
+            if selected_info is None:
+                self.live_focus_camera_label.set_text("No camera selected")
+            else:
+                self.live_focus_camera_label.set_text(f"Channel {selected_info.number} - {selected_info.name}")
+        self._refresh_live_grid_assignments()
+
+    def _request_start_live_grid(self) -> None:
+        if not self.core.get_capabilities().supports_live:
+            self._set_status("Live grid is not supported by the backend.")
+            return
+        if self.playback_handle >= 0:
+            self._request_stop_playback(status_text="Stopping archive playback before live grid start...")
+        self.live_grid_enabled = True
+        self.live_grid_generation += 1
+        generation = self.live_grid_generation
+        started = 0
+        for cell in self.live_grid_cells:
+            if cell.channel is None or cell.xid <= 0:
+                continue
+            if self.active_live_channel == cell.channel:
+                continue
+            if cell.handle >= 0:
+                continue
+            started += 1
+            self.core.start_live(
+                channel=cell.channel,
+                profile=self._grid_profile(),
+                host_binding=self._host_binding(cell.host, cell.xid),
+                on_done=lambda handle, cell_index=cell.index, channel=cell.channel, gen=generation: self._handle_live_grid_started(gen, cell_index, channel, int(handle)),
+                on_error=lambda message, cell_index=cell.index, channel=cell.channel, gen=generation: self._handle_live_grid_error(gen, cell_index, channel, message),
+            )
+        if started:
+            self._set_status("Starting live grid...")
+        else:
+            self._set_status("Live grid is ready.")
+        self._refresh_live_controls()
+
+    def _request_stop_live_grid_cell(self, cell: LiveGridCellState) -> None:
+        handle = cell.handle
+        if handle < 0:
+            return
+        cell.handle = -1
+        channel = cell.channel
+        self.core.stop_live(
+            session_id=handle,
+            on_done=lambda _result: False,
+            on_error=lambda message, ch=channel: self._handle_live_grid_stop_error(ch, message),
+        )
+
+    def _request_stop_live_grid(self, *, status_text: str | None = None) -> None:
+        self.live_grid_enabled = False
+        self.live_grid_generation += 1
+        for cell in self.live_grid_cells:
+            self._request_stop_live_grid_cell(cell)
+        if status_text:
+            self._set_status(status_text)
+        self._refresh_live_controls()
+
+    def _request_stop_all_live(self, *, status_text: str | None = None) -> None:
+        if self.live_handle >= 0:
+            self._request_stop_live_preview(restart_grid=False)
+        self._request_stop_live_grid(status_text=status_text)
+
+    def _handle_live_grid_started(self, generation: int, cell_index: int, channel: int | None, handle: int) -> bool:
+        if channel is None or cell_index < 0 or cell_index >= len(self.live_grid_cells):
+            self.core.stop_live(session_id=handle, on_done=lambda _result: False, on_error=lambda _message: False)
+            return False
+        cell = self.live_grid_cells[cell_index]
+        if generation != self.live_grid_generation or not self.live_grid_enabled or cell.channel != channel or self.active_live_channel == channel:
+            self.core.stop_live(session_id=handle, on_done=lambda _result: False, on_error=lambda _message: False)
+            return False
+        cell.handle = handle
+        self._refresh_live_controls()
+        return False
+
+    def _handle_live_grid_error(self, generation: int, cell_index: int, channel: int | None, message: str) -> bool:
+        if generation != self.live_grid_generation or cell_index < 0 or cell_index >= len(self.live_grid_cells):
+            return False
+        cell = self.live_grid_cells[cell_index]
+        cell.handle = -1
+        label = f"Grid error on channel {channel}: {message}" if channel is not None else f"Grid error: {message}"
+        self._set_status(label)
+        self._refresh_live_controls()
+        return False
+
+    def _handle_live_grid_stop_error(self, channel: int | None, message: str) -> bool:
+        label = f"Grid stop failed for channel {channel}: {message}" if channel is not None else f"Grid stop failed: {message}"
+        self._set_status(label)
+        self._refresh_live_controls()
+        return False
+
+    def _on_live_grid_host_ready(self, cell_index: int, xid: int) -> None:
+        if 0 <= cell_index < len(self.live_grid_cells):
+            self.live_grid_cells[cell_index].xid = xid
+        if self.live_grid_enabled:
+            self._request_start_live_grid()
+        self._refresh_live_controls()
+
+    def _on_live_grid_host_resize(self, cell_index: int, width: int, height: int) -> None:
+        if cell_index < 0 or cell_index >= len(self.live_grid_cells):
+            return
+        cell = self.live_grid_cells[cell_index]
+        if cell.handle >= 0:
+            self.core.resize_surface(
+                session_id=cell.handle,
+                width=width,
+                height=height,
+                on_done=lambda _result=None: None,
+                    on_error=lambda _message: False,
+            )
+
+    def _on_live_grid_tile_click(self, cell_index: int, event: Gdk.EventButton) -> None:
+        if cell_index < 0 or cell_index >= len(self.live_grid_cells):
+            return
+        cell = self.live_grid_cells[cell_index]
+        self._select_live_channel(cell.channel)
+        if event.type == Gdk.EventType._2BUTTON_PRESS and cell.channel is not None:
+            self._request_start_live_preview(cell.channel)
+
+    def _on_focus_grid_cell(self, cell_index: int) -> None:
+        if cell_index < 0 or cell_index >= len(self.live_grid_cells):
+            return
+        channel = self.live_grid_cells[cell_index].channel
+        if channel is None:
+            return
+        self._select_live_channel(channel)
+        self._request_start_live_preview(channel)
+
+    def _on_live_sidebar_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        model, treeiter = selection.get_selected()
+        if model is None or treeiter is None:
+            return
+        self.selected_live_channel = int(model[treeiter][0])
+        self._refresh_live_controls()
+
+    def _on_live_sidebar_row_activated(
+        self,
+        _tree: Gtk.TreeView,
+        path: Gtk.TreePath,
+        _column: Gtk.TreeViewColumn | None,
+    ) -> None:
+        model = self.live_sidebar_store
+        treeiter = model.get_iter(path)
+        if treeiter is None:
+            return
+        channel = int(model[treeiter][0])
+        self._select_live_channel(channel)
+        self._request_start_live_preview(channel)
 
     def _build_archive_tab(self) -> Gtk.Widget:
         outer = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
@@ -206,7 +726,14 @@ class MainWindow(Gtk.Window):
         playback_frame = Gtk.Frame(label="Playback Surface")
         playback_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
         playback_box.set_border_width(8)
-        self.video_host = X11VideoHost(on_ready=self._on_playback_host_ready, on_resize=self._on_playback_host_resize)
+        self.video_host = X11VideoHost(
+            on_ready=self._on_playback_host_ready,
+            on_resize=self._on_playback_host_resize,
+            on_drag_start=self._on_drag_start,
+            on_drag_motion=self._on_drag_motion,
+            on_drag_end=self._on_drag_end,
+            on_zoom_wheel=self._on_zoom_wheel,
+        )
         playback_box.pack_start(self.video_host, True, True, 0)
 
         playback_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
@@ -238,6 +765,21 @@ class MainWindow(Gtk.Window):
         self.stop_playback_button.connect("clicked", self._on_stop_playback)
         playback_controls.pack_start(self.stop_playback_button, False, False, 0)
         playback_box.pack_start(playback_controls, False, False, 0)
+
+        # Zoom controls
+        zoom_controls = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=5)
+        self.zoom_in_button = Gtk.Button(label="Zoom In")
+        self.zoom_in_button.connect("clicked", self._on_zoom_in)
+        zoom_controls.pack_start(self.zoom_in_button, False, False, 0)
+
+        self.zoom_out_button = Gtk.Button(label="Zoom Out")
+        self.zoom_out_button.connect("clicked", self._on_zoom_out)
+        zoom_controls.pack_start(self.zoom_out_button, False, False, 0)
+
+        self.reset_zoom_button = Gtk.Button(label="Reset Zoom")
+        self.reset_zoom_button.connect("clicked", self._on_reset_zoom)
+        zoom_controls.pack_start(self.reset_zoom_button, False, False, 0)
+        playback_box.pack_start(zoom_controls, False, False, 0)
 
         self.playback_info_label = Gtk.Label(
             label="Выберите файл архива или кликните по сегменту на timeline.",
@@ -332,6 +874,24 @@ class MainWindow(Gtk.Window):
         system_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
         system_scroll.add(self.system_view)
         box.pack_start(system_scroll, True, True, 0)
+
+        diff_frame = Gtk.Frame(label="Diagnostic diff by channel")
+        diff_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        diff_box.set_border_width(8)
+        diff_frame.add(diff_box)
+        self.diagnostic_diff_store = Gtk.ListStore(int, str, str, str, str)
+        self.diagnostic_diff_tree = Gtk.TreeView(model=self.diagnostic_diff_store)
+        for index, title in enumerate(("Channel", "Name", "Baseline", "Current", "Diff")):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            self.diagnostic_diff_tree.append_column(column)
+        diff_scroll = Gtk.ScrolledWindow()
+        diff_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        diff_scroll.set_min_content_height(180)
+        diff_scroll.add(self.diagnostic_diff_tree)
+        diff_box.pack_start(diff_scroll, True, True, 0)
+        box.pack_start(diff_frame, True, True, 0)
         return box
 
     def _prefill_from_runtime_config(self) -> None:
@@ -341,17 +901,24 @@ class MainWindow(Gtk.Window):
             self.port_entry.set_text("8000")
             self.user_entry.set_text("admin")
             self._set_reports_text("Coverage and export reports will appear here.")
-            self._refresh_online_status_store()
+            self._refresh_live_sidebar_store()
             return
 
         self.host_entry.set_text(config.connection.host)
         self.port_entry.set_text(str(config.connection.port))
         self.user_entry.set_text(config.connection.username)
         self.password_entry.set_text(config.connection.password)
-        self._set_channels(config.channels)
+        self._set_channels(config.current_channels or config.channels)
         self._set_system_text(config.last_diagnostic_summary or config.diagnostics_summary or "Saved runtime config loaded.")
         self._set_reports_text("Coverage and export reports will appear here.")
         self._set_status(f"Loaded saved runtime config ({config.detected_mode}).")
+        self._set_diagnostic_diff(DiagnosticState(
+            generated_at=config.last_diagnostic_at or "",
+            baseline_channels=config.baseline_channels,
+            current_channels=config.current_channels or config.channels,
+            summary_text=config.last_diagnostic_summary or config.diagnostics_summary or "",
+            has_changes=False,
+        ))
 
     def _schedule_diagnostics(self) -> None:
         if self.current_runtime_config is None:
@@ -372,8 +939,8 @@ class MainWindow(Gtk.Window):
     def _on_periodic_diagnostic(self) -> bool:
         if self.current_runtime_config is None:
             return True
-        if self.playback_handle >= 0:
-            self._set_status("Periodic diagnostic skipped while archive playback is active.")
+        if self.playback_handle >= 0 or self._has_active_live():
+            self._set_status("Periodic diagnostic skipped while live/archive session is active.")
             return True
         self._set_status("Running periodic diagnostic...")
         self.core.run_saved_diagnostic(
@@ -396,6 +963,29 @@ class MainWindow(Gtk.Window):
     def _set_reports_text(self, text: str) -> None:
         self._set_text_view(self.reports_view, text)
 
+    def _set_diagnostic_diff(self, diagnostic_state: DiagnosticState) -> None:
+        self.diagnostic_diff_store.clear()
+        baseline_map = {channel.number: channel for channel in diagnostic_state.baseline_channels}
+        current_map = {channel.number: channel for channel in diagnostic_state.current_channels}
+        all_channel_ids = sorted(set(baseline_map) | set(current_map))
+        for number in all_channel_ids:
+            baseline = baseline_map.get(number)
+            current = current_map.get(number)
+            baseline_status = baseline.status_text if baseline is not None else "missing"
+            current_status = current.status_text if current is not None else "missing"
+            name = current.name if current is not None else baseline.name if baseline is not None else str(number)
+            if baseline is None:
+                diff_text = "unexpected"
+            elif current is None:
+                diff_text = "missing"
+            elif baseline_status == current_status:
+                diff_text = "OK"
+            else:
+                diff_text = f"{baseline_status} → {current_status}"
+            self.diagnostic_diff_store.append(
+                [number, name, baseline_status, current_status, diff_text]
+            )
+
     def _read_connection_params(self) -> ConnectionParams:
         return ConnectionParams(
             host=self.host_entry.get_text().strip(),
@@ -410,22 +1000,23 @@ class MainWindow(Gtk.Window):
             combo.append_text(f"{channel.number} — {channel.name} [{channel.kind}; {channel.status_text}]")
 
     def _refresh_online_status_store(self) -> None:
-        self.online_status_store.clear()
-        for channel in self.current_channels:
-            self.online_status_store.append(
-                [channel.number, channel.name, channel.kind, channel.status_text]
-            )
+        self._refresh_live_sidebar_store()
 
     def _set_channels(self, channels: list[ChannelInfo]) -> None:
         self.current_channels = channels
         self._populate_channel_combo(self.channel_combo)
         self._populate_channel_combo(self.report_channel_combo)
-        self._refresh_online_status_store()
+        self._refresh_live_sidebar_store()
         if channels:
             self._syncing_channel_selection = True
             self.channel_combo.set_active(0)
             self.report_channel_combo.set_active(0)
             self._syncing_channel_selection = False
+        current_numbers = {item.number for item in channels}
+        if self.selected_live_channel not in current_numbers:
+            self.selected_live_channel = channels[0].number if channels else None
+        self._refresh_live_grid_assignments()
+        self._refresh_live_controls()
 
     def _try_selected_channel_from_combo(self, combo: Gtk.ComboBoxText) -> int | None:
         index = combo.get_active()
@@ -435,6 +1026,13 @@ class MainWindow(Gtk.Window):
 
     def _try_selected_channel(self) -> int | None:
         return self._try_selected_channel_from_combo(self.channel_combo)
+
+    def _try_selected_live_channel(self) -> int | None:
+        if self.selected_live_channel is None:
+            return None
+        if any(channel.number == self.selected_live_channel for channel in self.current_channels):
+            return self.selected_live_channel
+        return None
 
     def _try_selected_report_channel(self) -> int | None:
         return self._try_selected_channel_from_combo(self.report_channel_combo)
@@ -548,8 +1146,141 @@ class MainWindow(Gtk.Window):
         self.playback_host_xid = xid
         self._set_playback_info(f"Playback host ready. X11 window id={xid}")
 
-    def _on_playback_host_resize(self, _xid: int, _width: int, _height: int) -> None:
-        return
+    def _on_playback_host_resize(self, _xid: int, width: int, height: int) -> None:
+        if self.playback_handle >= 0:
+            self.core.resize_surface(
+                session_id=self.playback_handle,
+                width=width,
+                height=height,
+                on_done=lambda result=None: None,
+                on_error=self._handle_error,
+            )
+
+    def _set_live_status(self, text: str) -> None:
+        self.live_status_label.set_text(text)
+
+    def _on_live_host_ready(self, xid: int) -> None:
+        self.live_host_xid = xid
+        self._set_live_status(f"Live host ready. X11 window id={xid}")
+        if self.pending_live_focus_channel is not None and self.live_handle < 0:
+            channel = self.pending_live_focus_channel
+            self.pending_live_focus_channel = None
+            GLib.idle_add(lambda channel_id=channel: self._request_start_live_preview(channel_id) or False)
+        self._refresh_live_controls()
+
+    def _on_live_host_resize(self, _xid: int, width: int, height: int) -> None:
+        if self.live_handle >= 0:
+            self.core.resize_surface(
+                session_id=self.live_handle,
+                width=width,
+                height=height,
+                on_done=lambda result=None: None,
+                on_error=lambda _message: False,
+            )
+
+    def _request_stop_live_preview(self, *, status_text: str | None = None, restart_grid: bool = True) -> None:
+        handle = self.live_handle
+        self.pending_live_focus_channel = None
+        if handle < 0:
+            self._set_live_view_mode("grid")
+            return
+        previous_channel = self.active_live_channel
+        self.live_handle = -1
+        self.active_live_channel = None
+        self._set_live_view_mode("grid")
+        self._refresh_live_controls()
+        if status_text:
+            self._set_status(status_text)
+        self._set_live_status("Live focus stopped.")
+        self.core.stop_live(
+            session_id=handle,
+            on_done=lambda _result: False,
+            on_error=lambda message: self._handle_live_error(f"Stop live focus failed: {message}"),
+        )
+        if restart_grid and self.live_grid_enabled and previous_channel is not None:
+            self._request_start_live_grid()
+
+    def _request_start_live_preview(self, channel: int) -> None:
+        self._select_live_channel(channel)
+        self._set_live_view_mode("focus")
+        if self.live_host_xid <= 0:
+            self.pending_live_focus_channel = channel
+            self._set_status("Preparing focus view...")
+            return
+        self.pending_live_focus_channel = None
+        if self.playback_handle >= 0:
+            self._request_stop_playback(status_text="Stopping archive playback before live focus...")
+        focused_cell = self._find_live_grid_cell(channel)
+        if focused_cell is not None and focused_cell.handle >= 0:
+            self._request_stop_live_grid_cell(focused_cell)
+        if self.live_handle >= 0:
+            self._request_stop_live_preview(status_text="Switching live focus...", restart_grid=True)
+
+        self.live_request_id += 1
+        request_id = self.live_request_id
+        self._set_status(f"Starting live focus channel={channel}...")
+        self._set_live_status("Starting live focus...")
+        self.core.start_live(
+            channel=channel,
+            profile=self._focus_profile(),
+            host_binding=self._host_binding(self.live_video_host, self.live_host_xid),
+            on_done=lambda handle: self._handle_live_started(request_id, channel, int(handle)),
+            on_error=lambda message: self._handle_live_error(message, request_id=request_id),
+        )
+
+    def _handle_live_started(self, request_id: int, channel: int, handle: int) -> bool:
+        if request_id != self.live_request_id:
+            self.core.stop_live(
+                session_id=handle,
+                on_done=lambda _result: False,
+                on_error=lambda _message: False,
+            )
+            return False
+        self.live_handle = handle
+        self.active_live_channel = channel
+        self.pending_live_focus_channel = None
+        self._set_live_view_mode("focus")
+        self._refresh_live_controls()
+        self._set_status(f"Live focus active: channel={channel}")
+        self._set_live_status(f"Live focus active on channel {channel}, handle={handle}.")
+        if self.live_grid_enabled:
+            self._request_start_live_grid()
+        return False
+
+    def _handle_live_error(self, message: str, *, request_id: int | None = None) -> bool:
+        if request_id is not None and request_id != self.live_request_id:
+            return False
+        if self.live_handle >= 0:
+            self.live_handle = -1
+        self.active_live_channel = None
+        self.pending_live_focus_channel = None
+        self._set_live_view_mode("grid")
+        self._refresh_live_controls()
+        self._set_status(f"Live error: {message}")
+        self._set_live_status(f"Live focus error: {message}")
+        if self.live_grid_enabled:
+            self._request_start_live_grid()
+        return False
+
+    def _on_start_live_grid(self, _button: Gtk.Button) -> None:
+        self._set_live_view_mode("grid")
+        self._request_start_live_grid()
+
+    def _on_stop_live_grid(self, _button: Gtk.Button) -> None:
+        self._request_stop_all_live(status_text="Stopping live sessions...")
+
+    def _on_start_live(self, _button: Gtk.Button) -> None:
+        channel = self._try_selected_live_channel()
+        if channel is None:
+            self._set_status("Select a channel before starting live focus.")
+            return
+        if not self.core.get_capabilities().supports_live:
+            self._set_status("Live mode is not supported by the backend.")
+            return
+        self._request_start_live_preview(channel)
+
+    def _on_stop_live(self, _button: Gtk.Button) -> None:
+        self._request_stop_live_preview(status_text="Returning focused channel to grid...")
 
     def _request_stop_playback(self, *, status_text: str | None = None) -> None:
         handle = self.playback_handle
@@ -579,6 +1310,8 @@ class MainWindow(Gtk.Window):
         if self.playback_host_xid <= 0:
             self._set_status("Playback host is not ready yet.")
             return
+        if self._has_active_live():
+            self._request_stop_all_live(status_text="Stopping live sessions before archive playback...")
 
         target_time = resume_time or item.start_time
         if target_time < item.start_time:
@@ -784,6 +1517,7 @@ class MainWindow(Gtk.Window):
         diagnostic_state, runtime_config = payload
         self.current_runtime_config = runtime_config
         self._set_channels(diagnostic_state.current_channels or runtime_config.channels)
+        self._set_diagnostic_diff(diagnostic_state)
         self._set_status(
             f"Diagnostic complete: baseline={len(diagnostic_state.baseline_channels)}, "
             f"current_enabled={len(diagnostic_state.current_channels)}"
@@ -914,6 +1648,105 @@ class MainWindow(Gtk.Window):
     def _on_frame_step_playback(self, _button: Gtk.Button) -> None:
         self._request_frame_step()
 
+    def _on_zoom_in(self, _button: Gtk.Button) -> None:
+        if self.playback_handle >= 0 and self.core.get_capabilities().supports_native_zoom:
+            # Simple zoom in: reduce visible area by 20%
+            current_zoom = getattr(self, '_current_zoom', ZoomState(0.0, 0.0, 1.0, 1.0))
+            new_w = current_zoom.width * 0.8
+            new_h = current_zoom.height * 0.8
+            new_x = current_zoom.x + (current_zoom.width - new_w) / 2
+            new_y = current_zoom.y + (current_zoom.height - new_h) / 2
+            new_zoom = ZoomState(new_x, new_y, new_w, new_h)
+            self._current_zoom = new_zoom
+            self.core.set_zoom(
+                session_id=self.playback_handle,
+                zoom_state=new_zoom,
+                on_done=lambda result=None: None,
+                on_error=self._handle_error,
+            )
+
+    def _on_zoom_out(self, _button: Gtk.Button) -> None:
+        if self.playback_handle >= 0 and self.core.get_capabilities().supports_native_zoom:
+            current_zoom = getattr(self, '_current_zoom', ZoomState(0.0, 0.0, 1.0, 1.0))
+            new_w = min(current_zoom.width / 0.8, 1.0)
+            new_h = min(current_zoom.height / 0.8, 1.0)
+            new_x = max(current_zoom.x - (new_w - current_zoom.width) / 2, 0.0)
+            new_y = max(current_zoom.y - (new_h - current_zoom.height) / 2, 0.0)
+            new_zoom = ZoomState(new_x, new_y, new_w, new_h)
+            self._current_zoom = new_zoom
+            self.core.set_zoom(
+                session_id=self.playback_handle,
+                zoom_state=new_zoom,
+                on_done=lambda result=None: None,
+                on_error=self._handle_error,
+            )
+
+    def _on_reset_zoom(self, _button: Gtk.Button) -> None:
+        if self.playback_handle >= 0 and self.core.get_capabilities().supports_native_zoom:
+            self._current_zoom = ZoomState(0.0, 0.0, 1.0, 1.0)
+            self.core.reset_zoom(
+                session_id=self.playback_handle,
+                on_done=lambda result=None: None,
+                on_error=self._handle_error,
+            )
+
+    def _on_drag_start(self, x: float, y: float) -> None:
+        if self.playback_handle >= 0 and self.core.get_capabilities().supports_native_zoom:
+            self._dragging = True
+            self._drag_start_x = x
+            self._drag_start_y = y
+            self._zoom_start_x = self._current_zoom.x
+            self._zoom_start_y = self._current_zoom.y
+
+    def _on_drag_motion(self, x: float, y: float) -> None:
+        if self.playback_handle >= 0 and self._dragging:
+            allocation = self.video_host.get_allocation()
+            widget_width = allocation.width
+            widget_height = allocation.height
+            if widget_width > 0 and widget_height > 0:
+                delta_x = (x - self._drag_start_x) / widget_width
+                delta_y = (y - self._drag_start_y) / widget_height
+                new_x = self._zoom_start_x - delta_x * self._current_zoom.width
+                new_y = self._zoom_start_y - delta_y * self._current_zoom.height
+                new_x = max(0.0, min(new_x, 1.0 - self._current_zoom.width))
+                new_y = max(0.0, min(new_y, 1.0 - self._current_zoom.height))
+                new_zoom = ZoomState(new_x, new_y, self._current_zoom.width, self._current_zoom.height)
+                self._current_zoom = new_zoom
+                self.core.set_zoom(
+                    session_id=self.playback_handle,
+                    zoom_state=new_zoom,
+                    on_done=lambda *args: None,
+                    on_error=self._handle_error,
+                )
+
+    def _on_drag_end(self, _x: float, _y: float) -> None:
+        self._dragging = False
+
+    def _on_zoom_wheel(self, x: float, y: float, direction: int) -> None:
+        if self.playback_handle >= 0 and self.core.get_capabilities().supports_native_zoom:
+            allocation = self.video_host.get_allocation()
+            widget_width = allocation.width
+            widget_height = allocation.height
+            if widget_width > 0 and widget_height > 0:
+                factor = 0.9 if direction > 0 else 1.1  # direction 1 = down/zoom out, -1 = up/zoom in
+                rel_x = x / widget_width
+                rel_y = y / widget_height
+                new_w = min(self._current_zoom.width * factor, 1.0)
+                new_h = min(self._current_zoom.height * factor, 1.0)
+                # Center on cursor
+                new_x = self._current_zoom.x + (self._current_zoom.width - new_w) * rel_x
+                new_y = self._current_zoom.y + (self._current_zoom.height - new_h) * rel_y
+                new_x = max(0.0, min(new_x, 1.0 - new_w))
+                new_y = max(0.0, min(new_y, 1.0 - new_h))
+                new_zoom = ZoomState(new_x, new_y, new_w, new_h)
+                self._current_zoom = new_zoom
+                self.core.set_zoom(
+                    session_id=self.playback_handle,
+                    zoom_state=new_zoom,
+                    on_done=lambda result=None: None,
+                    on_error=self._handle_error,
+                )
+
     def _on_build_coverage_report(self, _button: Gtk.Button) -> None:
         channel = self._try_selected_report_channel()
         if channel is None:
@@ -948,5 +1781,16 @@ class MainWindow(Gtk.Window):
                 self.core.plugin.stop_archive_playback(self.playback_handle)
             except Exception:
                 pass
+        if self.live_handle >= 0:
+            try:
+                self.core.plugin.stop_live(self.live_handle)
+            except Exception:
+                pass
+        for cell in self.live_grid_cells:
+            if cell.handle >= 0:
+                try:
+                    self.core.plugin.stop_live(cell.handle)
+                except Exception:
+                    pass
         self.core.shutdown()
         Gtk.main_quit()

@@ -11,7 +11,18 @@ import gi
 gi.require_version("GLib", "2.0")
 from gi.repository import GLib
 
-from contracts import ChannelInfo, ConnectionParams, DiagnosticState, RuntimeConfig, runtime_config_from_dict, runtime_config_to_dict
+from contracts import (
+    ChannelInfo,
+    ConnectionParams,
+    DiagnosticState,
+    RuntimeConfig,
+    StreamProfile,
+    VideoHostBinding,
+    ZoomState,
+    LIVE_PROFILE_MAIN,
+    runtime_config_from_dict,
+    runtime_config_to_dict,
+)
 from hikvision_plugin import HikvisionPlugin
 
 
@@ -29,6 +40,9 @@ class ApplicationCore:
         self.runtime_config: RuntimeConfig | None = self.load_runtime_config()
         if self.runtime_config is not None:
             self.plugin.current_params = self.runtime_config.connection
+
+    def get_capabilities(self):
+        return self.plugin.get_capabilities()
 
     @staticmethod
     def _enabled_channels(channels: list[ChannelInfo]) -> list[ChannelInfo]:
@@ -134,7 +148,8 @@ class ApplicationCore:
             created_at=existing_config.created_at if existing_config is not None else generated_at,
             connection=params,
             detected_mode=str(report.mode),
-            channels=baseline_channels,
+            baseline_channels=baseline_channels,
+            current_channels=current_enabled,
             diagnostics_summary=summary_text,
             last_diagnostic_at=generated_at,
             last_diagnostic_summary=summary_text,
@@ -178,9 +193,9 @@ class ApplicationCore:
             try:
                 result = done_future.result()
             except Exception as exc:
-                GLib.idle_add(on_error, str(exc))
+                GLib.idle_add(lambda exc_val=exc: on_error(str(exc_val)))
                 return
-            GLib.idle_add(on_done, result)
+            GLib.idle_add(lambda: on_done(result))
 
         future.add_done_callback(_finish)
         return future
@@ -301,6 +316,25 @@ class ApplicationCore:
             on_error,
         )
 
+    def start_live(
+        self,
+        *,
+        channel: int,
+        profile: StreamProfile,
+        host_binding: VideoHostBinding,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.start_live(
+                channel=channel,
+                profile=profile,
+                host_binding=host_binding,
+            ),
+            on_done,
+            on_error,
+        )
+
     def stop_archive_playback(
         self,
         *,
@@ -310,6 +344,80 @@ class ApplicationCore:
     ) -> Future[Any]:
         return self._submit(
             lambda: self.plugin.stop_archive_playback(handle),
+            on_done,
+            on_error,
+        )
+
+    def stop_live(
+        self,
+        *,
+        session_id: int,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.stop_live(session_id),
+            on_done,
+            on_error,
+        )
+
+    def switch_live_profile(
+        self,
+        *,
+        session_id: int,
+        profile: StreamProfile,
+        host_binding: VideoHostBinding,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.switch_live_profile(
+                session_id=session_id,
+                profile=profile,
+                host_binding=host_binding,
+            ),
+            on_done,
+            on_error,
+        )
+
+    def resize_surface(
+        self,
+        *,
+        session_id: int,
+        width: int,
+        height: int,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.resize_surface(session_id, width, height),
+            on_done,
+            on_error,
+        )
+
+    def set_zoom(
+        self,
+        *,
+        session_id: int,
+        zoom_state: ZoomState,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.set_zoom(session_id, zoom_state),
+            on_done,
+            on_error,
+        )
+
+    def reset_zoom(
+        self,
+        *,
+        session_id: int,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.reset_zoom(session_id),
             on_done,
             on_error,
         )
@@ -392,4 +500,33 @@ class ApplicationCore:
             lambda: self.plugin.get_archive_playback_time(handle),
             on_done,
             on_error,
+        )
+
+    def start_live_preview(
+        self,
+        *,
+        channel: int,
+        window_id: int,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self.start_live(
+            channel=channel,
+            profile=LIVE_PROFILE_MAIN,
+            host_binding=VideoHostBinding(window_id=window_id, width=0, height=0),
+            on_done=on_done,
+            on_error=on_error,
+        )
+
+    def stop_live_preview(
+        self,
+        *,
+        handle: int,
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self.stop_live(
+            session_id=handle,
+            on_done=on_done,
+            on_error=on_error,
         )
