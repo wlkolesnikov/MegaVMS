@@ -386,11 +386,12 @@ class ApplicationCore:
         session_id: int,
         width: int,
         height: int,
+        window_id: int | None = None,
         on_done: ResultCallback,
         on_error: ErrorCallback,
     ) -> Future[Any]:
         return self._submit(
-            lambda: self.plugin.resize_surface(session_id, width, height),
+            lambda: self.plugin.resize_surface(session_id, width, height, window_id=window_id),
             on_done,
             on_error,
         )

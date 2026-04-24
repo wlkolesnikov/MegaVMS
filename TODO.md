@@ -5,7 +5,7 @@
 - `Система`: первичное подключение, baseline, автодиагностика
 - `Архив`: загрузка дня, список файлов, timeline, запуск native playback
 - `Отчёты`: coverage report
-- `Онлайн`: пока shell
+- `Онлайн`: базовый live grid/focus shell
 
 ## Phase 1 scope
 
@@ -40,6 +40,11 @@
 
 - `runtime_config.json` хранит baseline enabled-каналов и последний diagnostic snapshot
 - `Система` показывает diagnostic summary и diff `baseline vs current`
+- `Онлайн` умеет:
+  - запускать live grid для назначенных каналов
+  - переключаться между `grid` и `focus`
+  - показывать focus stream в отдельном host
+  - возвращать канал из focus обратно в grid
 - `Архив` умеет:
   - загрузить архив за день
   - показать список файлов
@@ -63,11 +68,22 @@
 - [x] Добавить capability checks для zoom/pan функций
 - [x] Доработать diagnostic diff до отдельной таблицы по каналам
 - [x] Разделить baseline и last-current-state в структуре конфига
+- [ ] Вкладка `Онлайн`: левое боковое меню на `Gtk.Revealer`
+- [ ] Вкладка `Онлайн`: раздел `Виды` в боковом меню
+- [ ] Переключение layout/grid presets из раздела `Виды`
+- [ ] Создание пользовательских видов с закреплением выбранных каналов по ячейкам
+- [ ] Сохранение/загрузка набора видов в runtime config
+- [ ] Вкладка `Онлайн`: раздел управления воспроизведением/просмотром
+- [ ] Кнопки transport control: `Play / Stop / Prev / Next`
+- [ ] Листание каналов или видов вправо/влево из transport controls
+- [ ] Кнопка `Скриншоты`: запрос кадров с каналов без запуска full live focus
+- [ ] Отображение snapshot-кадров прямо в ячейках grid
+- [ ] Явное состояние ячейки: `live / snapshot / idle / error`
 
 ## Deferred
 
 - [x] Live mode (basic live preview support added; channel selector on Online tab)
-- [x] Live grid low-res / focus high-res switching
+- [ ] Live grid low-res / focus high-res switching
 - [ ] Fullscreen transition for focus mode
-- [ ] Snapshot mode for grid
+- [ ] Отдельный инструмент/панель для вывода `self.status_label`
 - [ ] Multi-vendor second plugin

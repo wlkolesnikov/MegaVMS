@@ -1071,26 +1071,53 @@ class HikvisionPlugin:
     def stop_live_preview(self, handle: int) -> None:
         self.stop_live(handle)
 
-    def resize_surface(self, session_id: int, width: int, height: int) -> None:
+    def resize_surface(
+        self,
+        session_id: int,
+        width: int,
+        height: int,
+        *,
+        window_id: int | None = None,
+    ) -> None:
         if session_id < 0:
             return
         self.ensure_connected()
         live_session = self._live_sessions.get(int(session_id))
         if live_session is not None:
+            if window_id is not None and int(window_id) > 0:
+                live_session.window_id = int(window_id)
             live_session.width = width
             live_session.height = height
+            # Linux live preview resize requires explicit window resolution refresh.
+            try:
+                hcnetsdk = self._resolve_sdk_library()
+                if hasattr(hcnetsdk, "NET_DVR_ChangeWndResolution"):
+                    hcnetsdk.NET_DVR_ChangeWndResolution.argtypes = [ctypes.c_int]
+                    hcnetsdk.NET_DVR_ChangeWndResolution.restype = ctypes.c_bool
+                    with self.service._sdk_lock:
+                        ok = hcnetsdk.NET_DVR_ChangeWndResolution(int(session_id))
+                    if not ok:
+                        logger.debug("NET_DVR_ChangeWndResolution returned False for live session_id=%s", session_id)
+            except Exception as exc:
+                logger.debug("NET_DVR_ChangeWndResolution failed for live session_id=%s: %s", session_id, exc)
             try:
                 hcnetsdk = self._resolve_sdk_library()
                 if hasattr(hcnetsdk, "NET_DVR_RealPlayRestart") and live_session.window_id > 0:
                     hcnetsdk.NET_DVR_RealPlayRestart.argtypes = [ctypes.c_int, ctypes.c_void_p]
                     hcnetsdk.NET_DVR_RealPlayRestart.restype = ctypes.c_bool
                     with self.service._sdk_lock:
-                        hcnetsdk.NET_DVR_RealPlayRestart(
+                        ok = hcnetsdk.NET_DVR_RealPlayRestart(
                             int(session_id),
                             ctypes.c_void_p(int(live_session.window_id)),
                         )
-            except Exception:
-                pass
+                    if not ok:
+                        logger.warning(
+                            "NET_DVR_RealPlayRestart returned False for session_id=%s window_id=%s",
+                            session_id,
+                            live_session.window_id,
+                        )
+            except Exception as exc:
+                logger.warning("Live resize restart failed for session_id=%s: %s", session_id, exc)
             return
         ok, _ = self.service.playback_control_v40(session_id, NET_DVR_CHANGEWNDRESOLUTION, in_buffer=None, out_buffer=None)
         if not ok:

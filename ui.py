@@ -141,6 +141,8 @@ class LiveGridCellState:
     xid: int = 0
     channel: int | None = None
     handle: int = -1
+    resize_source_id: int = 0
+    pending_size: tuple[int, int] = (0, 0)
 
 
 class MainWindow(Gtk.Window):
@@ -148,6 +150,30 @@ class MainWindow(Gtk.Window):
 
     def __init__(self, core: ApplicationCore) -> None:
         super().__init__(title="SDK-HIK GTK Phase 1")
+        css_provider = Gtk.CssProvider()
+        css_provider.load_from_data(
+            b"""
+            .live-grid-overlay {
+                background-color: transparent;
+                background-image: none;
+                box-shadow: none;
+                border: none;
+                padding: 0;
+            }
+            label.live-grid-overlay {
+                background-color: transparent;
+                background-image: none;
+                box-shadow: none;
+                border: none;
+                padding: 0;
+            }
+            """
+        )
+        Gtk.StyleContext.add_provider_for_screen(
+            Gdk.Screen.get_default(),
+            css_provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_USER,
+        )
         self.core = core
         self.current_runtime_config: RuntimeConfig | None = self.core.runtime_config
         self.current_channels: list[ChannelInfo] = (
@@ -174,6 +200,8 @@ class MainWindow(Gtk.Window):
         self.live_grid_enabled = False
         self.live_grid_generation = 0
         self.live_grid_cells: list[LiveGridCellState] = []
+        self.live_focus_resize_source_id = 0
+        self.live_focus_pending_size: tuple[int, int] = (0, 0)
         self.playback_paused = False
         self.playback_speed_factor = 1.0
         self.playback_position_time: datetime | None = None
@@ -201,18 +229,30 @@ class MainWindow(Gtk.Window):
         self.notebook.append_page(self._build_reports_tab(), Gtk.Label(label="Отчёты"))
         self.notebook.append_page(self._build_system_tab(), Gtk.Label(label="Система"))
 
+        # Keep internal status storage without rendering a dedicated status panel.
         self.status_label = Gtk.Label(xalign=0.0)
         self.status_label.set_line_wrap(True)
-        status_frame = Gtk.Frame(label="Статус")
-        status_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        status_box.set_border_width(8)
-        status_box.pack_start(self.status_label, False, False, 0)
-        status_frame.add(status_box)
-        root.pack_start(status_frame, False, False, 0)
 
         self._prefill_from_runtime_config()
         self._schedule_diagnostics()
         self.show_all()
+
+    @staticmethod
+    def _force_transparent(widget: Gtk.Widget) -> None:
+        rgba = Gdk.RGBA()
+        rgba.parse("rgba(0,0,0,0)")
+        for state in (
+            Gtk.StateFlags.NORMAL,
+            Gtk.StateFlags.ACTIVE,
+            Gtk.StateFlags.PRELIGHT,
+            Gtk.StateFlags.SELECTED,
+            Gtk.StateFlags.INSENSITIVE,
+            Gtk.StateFlags.BACKDROP,
+        ):
+            try:
+                widget.override_background_color(state, rgba)
+            except Exception:
+                pass
 
     def _build_online_tab(self) -> Gtk.Widget:
         outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
@@ -281,36 +321,53 @@ class MainWindow(Gtk.Window):
 
             host = X11VideoHost(
                 on_ready=lambda xid, cell_index=index: self._on_live_grid_host_ready(cell_index, xid),
-                on_resize=lambda _xid, width, height, cell_index=index: self._on_live_grid_host_resize(cell_index, width, height),
+                on_resize=lambda xid, width, height, cell_index=index: self._on_live_grid_host_resize(cell_index, xid, width, height),
                 on_click=lambda event, cell_index=index: self._on_live_grid_tile_click(cell_index, event),
             )
-            host.set_size_request(420, 236)
-            overlay.add(host)
-
-            header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-            header.set_halign(Gtk.Align.FILL)
-            header.set_valign(Gtk.Align.START)
-            header.set_margin_top(8)
-            header.set_margin_start(8)
-            header.set_margin_end(8)
-            overlay.add_overlay(header)
+            host.set_size_request(-1, -1)
+            tile_aspect = Gtk.AspectFrame(
+                xalign=0.5,
+                yalign=0.5,
+                ratio=(16.0 / 9.0),
+                obey_child=False,
+            )
+            tile_aspect.set_hexpand(True)
+            tile_aspect.set_vexpand(True)
+            tile_aspect.add(host)
+            overlay.add(tile_aspect)
 
             title_label = Gtk.Label(label=f"Slot {index + 1}", xalign=0.0)
-            title_label.set_halign(Gtk.Align.START)
-            title_label.set_line_wrap(True)
-            header.pack_start(title_label, True, True, 0)
+            title_label.get_style_context().add_class("live-grid-overlay")
+            title_label.set_line_wrap(False)
+            self._force_transparent(title_label)
+            title_box = Gtk.EventBox()
+            title_box.set_visible_window(False)
+            title_box.set_halign(Gtk.Align.START)
+            title_box.set_valign(Gtk.Align.START)
+            title_box.set_margin_top(12)
+            title_box.set_margin_start(10)
+            title_box.add(title_label)
+            overlay.add_overlay(title_box)
 
             expand_button = Gtk.Button(label="Expand")
+            expand_button.set_halign(Gtk.Align.END)
+            expand_button.set_valign(Gtk.Align.START)
+            expand_button.set_margin_top(8)
+            expand_button.set_margin_end(8)
             expand_button.connect("clicked", lambda _button, cell_index=index: self._on_focus_grid_cell(cell_index))
-            header.pack_end(expand_button, False, False, 0)
+            overlay.add_overlay(expand_button)
 
             status_label = Gtk.Label(label="Idle slot", xalign=0.0)
+            status_label.get_style_context().add_class("live-grid-overlay")
             status_label.set_halign(Gtk.Align.START)
             status_label.set_valign(Gtk.Align.END)
+            status_label.set_hexpand(False)
+            status_label.set_vexpand(False)
             status_label.set_margin_start(8)
             status_label.set_margin_end(8)
             status_label.set_margin_bottom(8)
-            status_label.set_line_wrap(True)
+            status_label.set_line_wrap(False)
+            self._force_transparent(status_label)
             overlay.add_overlay(status_label)
 
             tile_grid.attach(cell_frame, index % 2, index // 2, 1, 1)
@@ -625,18 +682,38 @@ class MainWindow(Gtk.Window):
             self._request_start_live_grid()
         self._refresh_live_controls()
 
-    def _on_live_grid_host_resize(self, cell_index: int, width: int, height: int) -> None:
+    def _on_live_grid_host_resize(self, cell_index: int, xid: int, width: int, height: int) -> None:
         if cell_index < 0 or cell_index >= len(self.live_grid_cells):
             return
         cell = self.live_grid_cells[cell_index]
-        if cell.handle >= 0:
-            self.core.resize_surface(
-                session_id=cell.handle,
-                width=width,
-                height=height,
-                on_done=lambda _result=None: None,
-                    on_error=lambda _message: False,
-            )
+        if xid > 0:
+            cell.xid = xid
+        if width <= 0 or height <= 0:
+            return
+        cell.pending_size = (width, height)
+        if cell.resize_source_id != 0:
+            GLib.source_remove(cell.resize_source_id)
+        cell.resize_source_id = GLib.timeout_add(40, self._flush_live_grid_resize, cell.index)
+
+    def _flush_live_grid_resize(self, cell_index: int) -> bool:
+        if cell_index < 0 or cell_index >= len(self.live_grid_cells):
+            return False
+        cell = self.live_grid_cells[cell_index]
+        cell.resize_source_id = 0
+        if cell.handle < 0:
+            return False
+        width, height = cell.pending_size
+        if width <= 0 or height <= 0:
+            return False
+        self.core.resize_surface(
+            session_id=cell.handle,
+            width=width,
+            height=height,
+            window_id=cell.xid if cell.xid > 0 else None,
+            on_done=lambda _result=None: None,
+            on_error=lambda _message: False,
+        )
+        return False
 
     def _on_live_grid_tile_click(self, cell_index: int, event: Gdk.EventButton) -> None:
         if cell_index < 0 or cell_index >= len(self.live_grid_cells):
@@ -1168,15 +1245,32 @@ class MainWindow(Gtk.Window):
             GLib.idle_add(lambda channel_id=channel: self._request_start_live_preview(channel_id) or False)
         self._refresh_live_controls()
 
-    def _on_live_host_resize(self, _xid: int, width: int, height: int) -> None:
-        if self.live_handle >= 0:
-            self.core.resize_surface(
-                session_id=self.live_handle,
-                width=width,
-                height=height,
-                on_done=lambda result=None: None,
-                on_error=lambda _message: False,
-            )
+    def _on_live_host_resize(self, xid: int, width: int, height: int) -> None:
+        if xid > 0:
+            self.live_host_xid = xid
+        if width <= 0 or height <= 0:
+            return
+        self.live_focus_pending_size = (width, height)
+        if self.live_focus_resize_source_id != 0:
+            GLib.source_remove(self.live_focus_resize_source_id)
+        self.live_focus_resize_source_id = GLib.timeout_add(40, self._flush_live_focus_resize)
+
+    def _flush_live_focus_resize(self) -> bool:
+        self.live_focus_resize_source_id = 0
+        if self.live_handle < 0:
+            return False
+        width, height = self.live_focus_pending_size
+        if width <= 0 or height <= 0:
+            return False
+        self.core.resize_surface(
+            session_id=self.live_handle,
+            width=width,
+            height=height,
+            window_id=self.live_host_xid if self.live_host_xid > 0 else None,
+            on_done=lambda result=None: None,
+            on_error=lambda _message: False,
+        )
+        return False
 
     def _request_stop_live_preview(self, *, status_text: str | None = None, restart_grid: bool = True) -> None:
         handle = self.live_handle
@@ -1775,6 +1869,13 @@ class MainWindow(Gtk.Window):
         return False
 
     def _on_destroy(self, _window: Gtk.Window) -> None:
+        if self.live_focus_resize_source_id != 0:
+            GLib.source_remove(self.live_focus_resize_source_id)
+            self.live_focus_resize_source_id = 0
+        for cell in self.live_grid_cells:
+            if cell.resize_source_id != 0:
+                GLib.source_remove(cell.resize_source_id)
+                cell.resize_source_id = 0
         self._stop_playback_tick()
         if self.playback_handle >= 0:
             try:
