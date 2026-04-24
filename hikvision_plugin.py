@@ -796,6 +796,8 @@ class HikvisionPlugin:
             diagnostics_summary=report.as_text(),
             last_diagnostic_at=generated_at,
             last_diagnostic_summary=report.as_text(),
+            online_views=[],
+            selected_online_view_id="",
         )
         self.current_params = params
         self.last_report = report

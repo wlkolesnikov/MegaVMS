@@ -153,6 +153,8 @@ class ApplicationCore:
             diagnostics_summary=summary_text,
             last_diagnostic_at=generated_at,
             last_diagnostic_summary=summary_text,
+            online_views=list(existing_config.online_views) if existing_config is not None else [],
+            selected_online_view_id=existing_config.selected_online_view_id if existing_config is not None else "",
         )
         diagnostic_state = DiagnosticState(
             generated_at=generated_at,

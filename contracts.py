@@ -113,6 +113,14 @@ class ChannelInfo:
 
 
 @dataclass(frozen=True)
+class OnlineView:
+    id: str
+    name: str
+    layout_id: str = "2x2"
+    slot_channels: list[int | None] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
 class ArchiveFile:
     filename: str
     start_time: datetime
@@ -138,6 +146,8 @@ class RuntimeConfig:
     diagnostics_summary: str = ""
     last_diagnostic_at: str = ""
     last_diagnostic_summary: str = ""
+    online_views: list[OnlineView] = field(default_factory=list)
+    selected_online_view_id: str = ""
 
     @property
     def channels(self) -> list[ChannelInfo]:
@@ -232,6 +242,16 @@ def runtime_config_to_dict(config: RuntimeConfig) -> dict[str, Any]:
         "diagnostics_summary": config.diagnostics_summary,
         "last_diagnostic_at": config.last_diagnostic_at,
         "last_diagnostic_summary": config.last_diagnostic_summary,
+        "online_views": [
+            {
+                "id": item.id,
+                "name": item.name,
+                "layout_id": item.layout_id,
+                "slot_channels": list(item.slot_channels),
+            }
+            for item in config.online_views
+        ],
+        "selected_online_view_id": config.selected_online_view_id,
     }
 
 
@@ -277,6 +297,35 @@ def _channel_info_list_from_payload(payload: Any) -> list[ChannelInfo]:
     return result
 
 
+def _online_view_list_from_payload(payload: Any) -> list[OnlineView]:
+    if not isinstance(payload, list):
+        return []
+    result: list[OnlineView] = []
+    for index, item in enumerate(payload):
+        if not isinstance(item, dict):
+            continue
+        slot_payload = item.get("slot_channels", [])
+        slot_channels: list[int | None] = []
+        if isinstance(slot_payload, list):
+            for value in slot_payload:
+                if value in (None, "", 0):
+                    slot_channels.append(None)
+                else:
+                    slot_channels.append(int(value))
+        view_id = str(item.get("id", "")).strip() or f"view-{index + 1}"
+        name = str(item.get("name", "")).strip() or f"View {index + 1}"
+        layout_id = str(item.get("layout_id", "2x2")).strip() or "2x2"
+        result.append(
+            OnlineView(
+                id=view_id,
+                name=name,
+                layout_id=layout_id,
+                slot_channels=slot_channels,
+            )
+        )
+    return result
+
+
 def runtime_config_from_dict(payload: dict[str, Any]) -> RuntimeConfig:
     connection_payload = payload.get("connection", {}) if isinstance(payload, dict) else {}
     baseline_payload = payload.get("baseline_channels")
@@ -284,6 +333,7 @@ def runtime_config_from_dict(payload: dict[str, Any]) -> RuntimeConfig:
     channels_payload = payload.get("channels", []) if isinstance(payload, dict) else []
     baseline_channels = _channel_info_list_from_payload(baseline_payload if baseline_payload is not None else channels_payload)
     current_channels = _channel_info_list_from_payload(current_payload if current_payload is not None else channels_payload)
+    online_views = _online_view_list_from_payload(payload.get("online_views", [])) if isinstance(payload, dict) else []
     return RuntimeConfig(
         plugin_name=str(payload.get("plugin_name", "hikvision")) if isinstance(payload, dict) else "hikvision",
         created_at=str(payload.get("created_at", datetime.now().isoformat(timespec="seconds"))),
@@ -299,4 +349,6 @@ def runtime_config_from_dict(payload: dict[str, Any]) -> RuntimeConfig:
         diagnostics_summary=str(payload.get("diagnostics_summary", "")) if isinstance(payload, dict) else "",
         last_diagnostic_at=str(payload.get("last_diagnostic_at", "")) if isinstance(payload, dict) else "",
         last_diagnostic_summary=str(payload.get("last_diagnostic_summary", "")) if isinstance(payload, dict) else "",
+        online_views=online_views,
+        selected_online_view_id=str(payload.get("selected_online_view_id", "")) if isinstance(payload, dict) else "",
     )

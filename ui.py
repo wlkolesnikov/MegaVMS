@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 
 import gi
@@ -24,6 +24,7 @@ from contracts import (
     ChannelInfo,
     ConnectionParams,
     DiagnosticState,
+    OnlineView,
     RuntimeConfig,
     VideoHostBinding,
     ZoomState,
@@ -55,7 +56,9 @@ class X11VideoHost(Gtk.EventBox):
         self._on_zoom_wheel = on_zoom_wheel
         self._on_click = on_click
         self._xid = 0
+        self._blank = True
         self.set_visible_window(True)
+        self.set_app_paintable(True)
         self.set_size_request(960, 540)
         self.set_hexpand(True)
         self.set_vexpand(True)
@@ -67,6 +70,7 @@ class X11VideoHost(Gtk.EventBox):
         )
         self.connect("realize", self._handle_realize)
         self.connect("size-allocate", self._handle_size_allocate)
+        self.connect("draw", self._handle_draw)
         self.connect("button-press-event", self._handle_button_press)
         self.connect("button-release-event", self._handle_button_release)
         self.connect("motion-notify-event", self._handle_motion_notify)
@@ -92,12 +96,24 @@ class X11VideoHost(Gtk.EventBox):
 
     def _handle_realize(self, _widget: Gtk.Widget) -> None:
         self._xid = self._extract_xid()
+        self._request_blank_redraw()
         if self._xid > 0:
             self._on_ready(self._xid)
 
     def _handle_size_allocate(self, _widget: Gtk.Widget, allocation: Gdk.Rectangle) -> None:
+        if self._blank and allocation.width > 0 and allocation.height > 0:
+            self._request_blank_redraw()
         if self._xid > 0 and allocation.width > 0 and allocation.height > 0:
             self._on_resize(self._xid, allocation.width, allocation.height)
+
+    def _handle_draw(self, _widget: Gtk.Widget, cr) -> bool:
+        if not self._blank:
+            return False
+        allocation = self.get_allocation()
+        cr.set_source_rgb(0.02, 0.02, 0.02)
+        cr.rectangle(0, 0, allocation.width, allocation.height)
+        cr.fill()
+        return True
 
     def _handle_button_press(self, widget: Gtk.Widget, event: Gdk.EventButton) -> bool:
         if event.button == 1 and self._on_click:
@@ -129,6 +145,22 @@ class X11VideoHost(Gtk.EventBox):
             self._on_zoom_wheel(event.x, event.y, direction)
         return True
 
+    def _request_blank_redraw(self) -> None:
+        window = self.get_window()
+        if window is not None:
+            window.invalidate_rect(None, False)
+        self.queue_draw()
+
+    def set_video_active(self, active: bool) -> None:
+        new_blank = not active
+        if self._blank == new_blank:
+            if self._blank:
+                self._request_blank_redraw()
+            return
+        self._blank = new_blank
+        if self._blank:
+            self._request_blank_redraw()
+
 
 @dataclass
 class LiveGridCellState:
@@ -147,6 +179,12 @@ class LiveGridCellState:
 
 class MainWindow(Gtk.Window):
     DIAGNOSTIC_INTERVAL_SECONDS = 600
+    LIVE_LAYOUT_SPECS = {
+        "1x1": (1, 1),
+        "2x2": (2, 2),
+        "3x3": (3, 3),
+    }
+    MAX_LIVE_GRID_CELLS = 9
 
     def __init__(self, core: ApplicationCore) -> None:
         super().__init__(title="SDK-HIK GTK Phase 1")
@@ -196,12 +234,17 @@ class MainWindow(Gtk.Window):
         self.active_live_channel: int | None = None
         self.selected_live_channel: int | None = None
         self.pending_live_focus_channel: int | None = None
+        self.live_views: list[OnlineView] = []
+        self.selected_live_view_id = ""
+        self.live_grid_layout_id = "2x2"
         self.live_view_mode = "grid"
         self.live_grid_enabled = False
         self.live_grid_generation = 0
         self.live_grid_cells: list[LiveGridCellState] = []
         self.live_focus_resize_source_id = 0
         self.live_focus_pending_size: tuple[int, int] = (0, 0)
+        self._syncing_live_channel_checks = False
+        self._suppress_live_view_selection = False
         self.playback_paused = False
         self.playback_speed_factor = 1.0
         self.playback_position_time: datetime | None = None
@@ -261,6 +304,11 @@ class MainWindow(Gtk.Window):
         toolbar = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
         outer.pack_start(toolbar, False, False, 0)
 
+        self.live_sidebar_toggle_button = Gtk.ToggleButton(label="Views")
+        self.live_sidebar_toggle_button.set_active(False)
+        self.live_sidebar_toggle_button.connect("toggled", self._on_toggle_live_sidebar)
+        toolbar.pack_start(self.live_sidebar_toggle_button, False, False, 0)
+
         self.live_grid_start_button = Gtk.Button(label="Start Live")
         self.live_grid_start_button.connect("clicked", self._on_start_live_grid)
         toolbar.pack_start(self.live_grid_start_button, False, False, 0)
@@ -277,7 +325,7 @@ class MainWindow(Gtk.Window):
         self.live_stop_button.connect("clicked", self._on_stop_live)
         toolbar.pack_start(self.live_stop_button, False, False, 0)
 
-        self.live_layout_label = Gtk.Label(label="Layout: 2x2", xalign=0.0)
+        self.live_layout_label = Gtk.Label(label="View: Default | Layout: 2x2", xalign=0.0)
         toolbar.pack_start(self.live_layout_label, False, False, 12)
 
         self.live_mode_label = Gtk.Label(label="Mode: Grid", xalign=0.0)
@@ -295,9 +343,131 @@ class MainWindow(Gtk.Window):
         self.live_stack.add_named(self._build_live_focus_view(), "focus")
         outer.pack_start(self.live_stack, True, True, 0)
 
+        self.live_sidebar_popover = Gtk.Popover.new(self.live_sidebar_toggle_button)
+        self.live_sidebar_popover.set_position(Gtk.PositionType.RIGHT)
+        self.live_sidebar_popover.set_modal(False)
+        self.live_sidebar_popover.connect("closed", self._on_live_sidebar_popover_closed)
+        self.live_sidebar_revealer = Gtk.Revealer()
+        self.live_sidebar_revealer.set_transition_type(Gtk.RevealerTransitionType.SLIDE_RIGHT)
+        self.live_sidebar_revealer.set_transition_duration(180)
+        self.live_sidebar_revealer.set_reveal_child(False)
+        self.live_sidebar_revealer.add(self._build_live_sidebar_panel())
+        self.live_sidebar_popover.add(self.live_sidebar_revealer)
+        self.live_sidebar_popover.set_size_request(360, 640)
+
         self._set_live_view_mode("grid")
+        self._set_online_views([], "")
         self._refresh_live_grid_assignments()
         return outer
+
+    def _build_live_sidebar_panel(self) -> Gtk.Widget:
+        panel = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
+        panel.set_size_request(340, -1)
+
+        views_frame = Gtk.Frame(label="Виды")
+        views_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        views_box.set_border_width(8)
+        views_frame.add(views_box)
+        panel.pack_start(views_frame, True, True, 0)
+
+        self.live_views_store = Gtk.ListStore(str, str, str, str)
+        self.live_views_tree = Gtk.TreeView(model=self.live_views_store)
+        self.live_views_tree.get_selection().connect("changed", self._on_live_view_selection_changed)
+        for index, title in enumerate(("Name", "Layout", "Slots")):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=index + 1)
+            column.set_resizable(True)
+            self.live_views_tree.append_column(column)
+        views_scroll = Gtk.ScrolledWindow()
+        views_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        views_scroll.set_min_content_height(180)
+        views_scroll.add(self.live_views_tree)
+        views_box.pack_start(views_scroll, True, True, 0)
+
+        layout_row = Gtk.Grid(column_spacing=8, row_spacing=8)
+        views_box.pack_start(layout_row, False, False, 0)
+
+        layout_label = Gtk.Label(label="Сетка", xalign=0.0)
+        layout_row.attach(layout_label, 0, 0, 1, 1)
+        self.live_view_layout_combo = Gtk.ComboBoxText()
+        for layout_id in self.LIVE_LAYOUT_SPECS:
+            self.live_view_layout_combo.append(layout_id, layout_id)
+        self.live_view_layout_combo.connect("changed", self._on_live_view_layout_changed)
+        layout_row.attach(self.live_view_layout_combo, 1, 0, 1, 1)
+
+        views_buttons = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        views_box.pack_start(views_buttons, False, False, 0)
+
+        self.live_new_view_button = Gtk.Button(label="Создать")
+        self.live_new_view_button.connect("clicked", self._on_new_live_view)
+        views_buttons.pack_start(self.live_new_view_button, True, True, 0)
+
+        self.live_delete_view_button = Gtk.Button(label="Удалить")
+        self.live_delete_view_button.connect("clicked", self._on_delete_live_view)
+        views_buttons.pack_start(self.live_delete_view_button, True, True, 0)
+
+        assign_frame = Gtk.Frame(label="Закрепление каналов")
+        assign_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        assign_box.set_border_width(8)
+        assign_frame.add(assign_box)
+        panel.pack_start(assign_frame, False, False, 0)
+
+        self.live_channel_selection_store = Gtk.ListStore(bool, int, str, str)
+        self.live_channel_selection_tree = Gtk.TreeView(model=self.live_channel_selection_store)
+        toggle_renderer = Gtk.CellRendererToggle()
+        toggle_renderer.connect("toggled", self._on_live_channel_toggled)
+        self.live_channel_selection_tree.append_column(Gtk.TreeViewColumn("On", toggle_renderer, active=0))
+        for index, title in enumerate(("Channel", "Name", "Status")):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=index + 1)
+            column.set_resizable(True)
+            self.live_channel_selection_tree.append_column(column)
+        channels_scroll = Gtk.ScrolledWindow()
+        channels_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        channels_scroll.set_min_content_height(220)
+        channels_scroll.add(self.live_channel_selection_tree)
+        assign_box.pack_start(channels_scroll, True, True, 0)
+
+        self.live_assignments_label = Gtk.Label(label="No active view.", xalign=0.0)
+        self.live_assignments_label.set_line_wrap(True)
+        assign_box.pack_start(self.live_assignments_label, False, False, 0)
+
+        controls_frame = Gtk.Frame(label="Управление просмотром")
+        controls_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        controls_box.set_border_width(8)
+        controls_frame.add(controls_box)
+        panel.pack_start(controls_frame, False, False, 0)
+
+        controls_row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        controls_box.pack_start(controls_row, False, False, 0)
+
+        self.live_sidebar_play_button = Gtk.Button(label="Play")
+        self.live_sidebar_play_button.connect("clicked", self._on_start_live_grid)
+        controls_row.pack_start(self.live_sidebar_play_button, True, True, 0)
+
+        self.live_sidebar_stop_button = Gtk.Button(label="Stop")
+        self.live_sidebar_stop_button.connect("clicked", self._on_stop_live_grid)
+        controls_row.pack_start(self.live_sidebar_stop_button, True, True, 0)
+
+        self.live_prev_button = Gtk.Button(label="Prev")
+        self.live_prev_button.connect("clicked", self._on_previous_live_channel)
+        controls_row.pack_start(self.live_prev_button, True, True, 0)
+
+        self.live_next_button = Gtk.Button(label="Next")
+        self.live_next_button.connect("clicked", self._on_next_live_channel)
+        controls_row.pack_start(self.live_next_button, True, True, 0)
+
+        self.live_snapshot_button = Gtk.Button(label="Screenshots")
+        self.live_snapshot_button.connect("clicked", self._on_live_snapshots)
+        controls_box.pack_start(self.live_snapshot_button, False, False, 0)
+
+        self.live_panel_hint_label = Gtk.Label(
+            label="Отметь каналы в списке. Они будут назначены в текущий вид по порядку сверху вниз, слева направо.",
+            xalign=0.0,
+        )
+        self.live_panel_hint_label.set_line_wrap(True)
+        controls_box.pack_start(self.live_panel_hint_label, False, False, 0)
+        return panel
 
     def _build_live_grid_view(self) -> Gtk.Widget:
         frame = Gtk.Frame(label="Live Grid")
@@ -305,13 +475,13 @@ class MainWindow(Gtk.Window):
         container.set_border_width(8)
         frame.add(container)
 
-        tile_grid = Gtk.Grid(column_spacing=10, row_spacing=10)
-        tile_grid.set_hexpand(True)
-        tile_grid.set_vexpand(True)
-        container.pack_start(tile_grid, True, True, 0)
+        self.live_grid_widget = Gtk.Grid(column_spacing=10, row_spacing=10)
+        self.live_grid_widget.set_hexpand(True)
+        self.live_grid_widget.set_vexpand(True)
+        container.pack_start(self.live_grid_widget, True, True, 0)
 
         self.live_grid_cells = []
-        for index in range(4):
+        for index in range(self.MAX_LIVE_GRID_CELLS):
             cell_frame = Gtk.Frame()
             cell_frame.set_hexpand(True)
             cell_frame.set_vexpand(True)
@@ -370,7 +540,6 @@ class MainWindow(Gtk.Window):
             self._force_transparent(status_label)
             overlay.add_overlay(status_label)
 
-            tile_grid.attach(cell_frame, index % 2, index // 2, 1, 1)
             self.live_grid_cells.append(
                 LiveGridCellState(
                     index=index,
@@ -381,6 +550,7 @@ class MainWindow(Gtk.Window):
                     expand_button=expand_button,
                 )
             )
+        self._apply_live_grid_layout()
         return frame
 
     def _build_live_focus_view(self) -> Gtk.Widget:
@@ -451,6 +621,188 @@ class MainWindow(Gtk.Window):
 
         return container
 
+    @classmethod
+    def _layout_dimensions(cls, layout_id: str) -> tuple[int, int]:
+        return cls.LIVE_LAYOUT_SPECS.get(layout_id, cls.LIVE_LAYOUT_SPECS["2x2"])
+
+    @classmethod
+    def _layout_slot_count(cls, layout_id: str) -> int:
+        columns, rows = cls._layout_dimensions(layout_id)
+        return columns * rows
+
+    def _default_online_view(self, *, layout_id: str = "2x2") -> OnlineView:
+        slot_count = self._layout_slot_count(layout_id)
+        slot_channels = [channel.number for channel in self.current_channels[:slot_count]]
+        while len(slot_channels) < slot_count:
+            slot_channels.append(None)
+        return OnlineView(
+            id="default",
+            name="Default",
+            layout_id=layout_id,
+            slot_channels=slot_channels,
+        )
+
+    def _sanitize_online_view(self, view: OnlineView) -> OnlineView:
+        layout_id = view.layout_id if view.layout_id in self.LIVE_LAYOUT_SPECS else "2x2"
+        slot_count = self._layout_slot_count(layout_id)
+        valid_channels = {channel.number for channel in self.current_channels}
+        slot_channels: list[int | None] = []
+        for value in list(view.slot_channels)[:slot_count]:
+            if value is None or value not in valid_channels:
+                slot_channels.append(None)
+            else:
+                slot_channels.append(value)
+        while len(slot_channels) < slot_count:
+            slot_channels.append(None)
+        if view.id == "default" and not any(slot_channels):
+            slot_channels = list(self._default_online_view(layout_id=layout_id).slot_channels)
+        return OnlineView(
+            id=view.id.strip() or "default",
+            name=view.name.strip() or "View",
+            layout_id=layout_id,
+            slot_channels=slot_channels,
+        )
+
+    def _current_online_view(self) -> OnlineView | None:
+        for item in self.live_views:
+            if item.id == self.selected_live_view_id:
+                return item
+        return self.live_views[0] if self.live_views else None
+
+    def _set_online_views(self, views: list[OnlineView], selected_id: str) -> None:
+        sanitized = [self._sanitize_online_view(item) for item in views]
+        if not sanitized:
+            sanitized = [self._default_online_view()]
+        self.live_views = sanitized
+        candidate_ids = {item.id for item in self.live_views}
+        self.selected_live_view_id = selected_id if selected_id in candidate_ids else self.live_views[0].id
+        self._apply_current_online_view()
+        self._refresh_live_views_store()
+        self._sync_live_view_form()
+
+    def _persist_runtime_config(self) -> None:
+        if self.current_runtime_config is None:
+            return
+        updated = replace(
+            self.current_runtime_config,
+            online_views=list(self.live_views),
+            selected_online_view_id=self.selected_live_view_id,
+        )
+        self.current_runtime_config = updated
+        self.core.save_runtime_config(updated)
+
+    def _replace_online_view(self, updated_view: OnlineView, *, persist: bool = True) -> None:
+        replacement = self._sanitize_online_view(updated_view)
+        updated_views: list[OnlineView] = []
+        found = False
+        for item in self.live_views:
+            if item.id == replacement.id:
+                updated_views.append(replacement)
+                found = True
+            else:
+                updated_views.append(item)
+        if not found:
+            updated_views.append(replacement)
+        self.live_views = updated_views
+        self.selected_live_view_id = replacement.id
+        self._apply_current_online_view()
+        self._refresh_live_views_store()
+        self._sync_live_view_form()
+        if persist:
+            self._persist_runtime_config()
+
+    def _apply_current_online_view(self) -> None:
+        current_view = self._current_online_view()
+        if current_view is None:
+            return
+        self.live_grid_layout_id = current_view.layout_id
+        self._apply_live_grid_layout()
+        self._refresh_live_grid_assignments()
+        self._refresh_live_channel_selection_store()
+        self._refresh_live_controls()
+
+    def _apply_live_grid_layout(self) -> None:
+        if not hasattr(self, "live_grid_widget"):
+            return
+        columns, rows = self._layout_dimensions(self.live_grid_layout_id)
+        slot_count = columns * rows
+        for child in self.live_grid_widget.get_children():
+            self.live_grid_widget.remove(child)
+        for index, cell in enumerate(self.live_grid_cells):
+            if index >= slot_count:
+                cell.frame.hide()
+                continue
+            self.live_grid_widget.attach(cell.frame, index % columns, index // columns, 1, 1)
+            cell.frame.show_all()
+
+    def _refresh_live_views_store(self) -> None:
+        if not hasattr(self, "live_views_store"):
+            return
+        self.live_views_store.clear()
+        for item in self.live_views:
+            assigned = sum(1 for value in item.slot_channels if value is not None)
+            self.live_views_store.append([item.id, item.name, item.layout_id, f"{assigned}/{len(item.slot_channels)}"])
+        selection = self.live_views_tree.get_selection()
+        self._suppress_live_view_selection = True
+        selection.unselect_all()
+        model = self.live_views_store
+        treeiter = model.get_iter_first()
+        while treeiter is not None:
+            if model[treeiter][0] == self.selected_live_view_id:
+                selection.select_iter(treeiter)
+                self.live_views_tree.scroll_to_cell(model.get_path(treeiter), None, True, 0.4, 0.0)
+                break
+            treeiter = model.iter_next(treeiter)
+        self._suppress_live_view_selection = False
+
+    def _refresh_live_channel_selection_store(self) -> None:
+        if not hasattr(self, "live_channel_selection_store"):
+            return
+        current_view = self._current_online_view()
+        assigned = set(channel for channel in (current_view.slot_channels if current_view is not None else []) if channel is not None)
+        self._syncing_live_channel_checks = True
+        self.live_channel_selection_store.clear()
+        for channel in self.current_channels:
+            self.live_channel_selection_store.append(
+                [channel.number in assigned, channel.number, channel.name, channel.status_text]
+            )
+        self._syncing_live_channel_checks = False
+
+    def _sync_live_view_form(self) -> None:
+        current_view = self._current_online_view()
+        if current_view is None:
+            return
+        if hasattr(self, "live_view_layout_combo"):
+            self.live_view_layout_combo.set_active_id(current_view.layout_id)
+        self._refresh_live_channel_selection_store()
+        if hasattr(self, "live_assignments_label"):
+            slot_lines = []
+            for index, channel in enumerate(current_view.slot_channels):
+                if channel is None:
+                    slot_lines.append(f"slot {index + 1}: empty")
+                    continue
+                channel_info = next((item for item in self.current_channels if item.number == channel), None)
+                if channel_info is None:
+                    slot_lines.append(f"slot {index + 1}: CH {channel}")
+                else:
+                    slot_lines.append(f"slot {index + 1}: CH {channel_info.number} {channel_info.name}")
+            self.live_assignments_label.set_text("\n".join(slot_lines) if slot_lines else "No slots in active view.")
+
+    def _next_live_view_name(self) -> str:
+        existing = {item.name for item in self.live_views}
+        index = 1
+        while True:
+            candidate = f"View {index}"
+            if candidate not in existing:
+                return candidate
+            index += 1
+
+    def _visible_live_channels(self) -> list[int]:
+        current_view = self._current_online_view()
+        if current_view is None:
+            return []
+        return [channel for channel in current_view.slot_channels if channel is not None]
+
     @staticmethod
     def _host_binding(host: X11VideoHost, xid: int) -> VideoHostBinding:
         allocation = host.get_allocation()
@@ -494,6 +846,7 @@ class MainWindow(Gtk.Window):
         for channel in self.current_channels:
             self.live_sidebar_store.append([channel.number, channel.name, channel.status_text])
         self._sync_live_sidebar_selection()
+        self._refresh_live_channel_selection_store()
 
     def _sync_live_sidebar_selection(self) -> None:
         if not hasattr(self, "live_sidebar_tree"):
@@ -530,15 +883,21 @@ class MainWindow(Gtk.Window):
         return None
 
     def _refresh_live_grid_assignments(self) -> None:
+        current_view = self._current_online_view()
+        slot_channels = current_view.slot_channels if current_view is not None else []
+        channel_map = {item.number: item for item in self.current_channels}
+        slot_count = self._layout_slot_count(self.live_grid_layout_id)
         for index, cell in enumerate(self.live_grid_cells):
-            assigned = self.current_channels[index] if index < len(self.current_channels) else None
+            assigned_number = slot_channels[index] if index < len(slot_channels) and index < slot_count else None
+            assigned = channel_map.get(assigned_number) if assigned_number is not None else None
             assigned_number = assigned.number if assigned is not None else None
             if cell.handle >= 0 and cell.channel != assigned_number:
                 self._request_stop_live_grid_cell(cell)
             cell.channel = assigned_number
             if assigned is None:
+                cell.host.set_video_active(False)
                 cell.title_label.set_text(f"Slot {index + 1}")
-                cell.status_label.set_text("Idle slot")
+                cell.status_label.set_text("Empty slot" if index < slot_count else "Hidden slot")
                 cell.expand_button.set_sensitive(False)
                 cell.frame.set_shadow_type(Gtk.ShadowType.OUT)
                 continue
@@ -558,6 +917,7 @@ class MainWindow(Gtk.Window):
 
     def _refresh_live_controls(self) -> None:
         supports_live = self.core.get_capabilities().supports_live
+        supports_snapshot = self.core.get_capabilities().supports_snapshot
         grid_ready = any(cell.xid > 0 and cell.channel is not None for cell in self.live_grid_cells)
         focus_ready = self.live_host_xid > 0
         self.live_grid_start_button.set_sensitive(supports_live and grid_ready and not self.live_grid_enabled)
@@ -571,6 +931,9 @@ class MainWindow(Gtk.Window):
         if selected_info is not None:
             selected_text = f"selected CH {selected_info.number}: {selected_info.name}"
         active_grid = sum(1 for cell in self.live_grid_cells if cell.handle >= 0)
+        current_view = self._current_online_view()
+        if current_view is not None:
+            self.live_layout_label.set_text(f"View: {current_view.name} | Layout: {current_view.layout_id}")
         if self.live_handle >= 0 and self.active_live_channel is not None:
             self.live_mode_label.set_text("Mode: Focus")
             self.live_toolbar_status_label.set_text(f"Focus active on channel {self.active_live_channel}; grid sessions {active_grid}")
@@ -588,7 +951,158 @@ class MainWindow(Gtk.Window):
                 self.live_focus_camera_label.set_text("No camera selected")
             else:
                 self.live_focus_camera_label.set_text(f"Channel {selected_info.number} - {selected_info.name}")
+        if hasattr(self, "live_sidebar_play_button"):
+            self.live_sidebar_play_button.set_sensitive(self.live_grid_start_button.get_sensitive())
+        if hasattr(self, "live_sidebar_stop_button"):
+            self.live_sidebar_stop_button.set_sensitive(
+                self.live_grid_stop_button.get_sensitive() or self.live_stop_button.get_sensitive()
+            )
+        if hasattr(self, "live_prev_button"):
+            self.live_prev_button.set_sensitive(len(self._visible_live_channels()) > 1)
+        if hasattr(self, "live_next_button"):
+            self.live_next_button.set_sensitive(len(self._visible_live_channels()) > 1)
+        if hasattr(self, "live_snapshot_button"):
+            self.live_snapshot_button.set_sensitive(supports_snapshot and bool(self._visible_live_channels()))
+            self.live_snapshot_button.set_tooltip_text(
+                None if supports_snapshot else "Current backend does not expose snapshot capture yet."
+            )
+        if hasattr(self, "live_delete_view_button"):
+            self.live_delete_view_button.set_sensitive(len(self.live_views) > 1)
+        self._sync_live_view_form()
         self._refresh_live_grid_assignments()
+
+    def _on_toggle_live_sidebar(self, button: Gtk.ToggleButton) -> None:
+        if button.get_active():
+            self.live_sidebar_popover.show_all()
+            self.live_sidebar_popover.popup()
+            self.live_sidebar_revealer.set_reveal_child(True)
+            return
+        self.live_sidebar_revealer.set_reveal_child(False)
+        GLib.timeout_add(
+            self.live_sidebar_revealer.get_transition_duration(),
+            self._hide_live_sidebar_popover,
+        )
+
+    def _hide_live_sidebar_popover(self) -> bool:
+        self.live_sidebar_popover.popdown()
+        return False
+
+    def _on_live_sidebar_popover_closed(self, _popover: Gtk.Popover) -> None:
+        self.live_sidebar_revealer.set_reveal_child(False)
+        if self.live_sidebar_toggle_button.get_active():
+            self.live_sidebar_toggle_button.set_active(False)
+
+    def _on_live_view_selection_changed(self, selection: Gtk.TreeSelection) -> None:
+        if self._suppress_live_view_selection:
+            return
+        model, treeiter = selection.get_selected()
+        if model is None or treeiter is None:
+            return
+        view_id = str(model[treeiter][0])
+        if not view_id or view_id == self.selected_live_view_id:
+            return
+        self.selected_live_view_id = view_id
+        self._apply_current_online_view()
+        self._refresh_live_views_store()
+        self._persist_runtime_config()
+
+    def _on_live_view_layout_changed(self, combo: Gtk.ComboBoxText) -> None:
+        current_view = self._current_online_view()
+        if current_view is None:
+            return
+        layout_id = combo.get_active_id()
+        if layout_id is None or layout_id == current_view.layout_id:
+            return
+        resized_channels = list(current_view.slot_channels[: self._layout_slot_count(layout_id)])
+        while len(resized_channels) < self._layout_slot_count(layout_id):
+            resized_channels.append(None)
+        self._replace_online_view(
+            replace(current_view, layout_id=layout_id, slot_channels=resized_channels),
+            persist=True,
+        )
+
+    def _on_new_live_view(self, _button: Gtk.Button) -> None:
+        current_view = self._current_online_view()
+        layout_id = current_view.layout_id if current_view is not None else "2x2"
+        new_view = OnlineView(
+            id=datetime.now().strftime("view-%Y%m%d%H%M%S%f"),
+            name=self._next_live_view_name(),
+            layout_id=layout_id,
+            slot_channels=[None] * self._layout_slot_count(layout_id),
+        )
+        self._replace_online_view(new_view, persist=True)
+
+    def _on_delete_live_view(self, _button: Gtk.Button) -> None:
+        current_view = self._current_online_view()
+        if current_view is None:
+            return
+        remaining = [item for item in self.live_views if item.id != current_view.id]
+        if not remaining:
+            remaining = [self._default_online_view()]
+        next_selected = remaining[0].id
+        self.live_views = remaining
+        self.selected_live_view_id = next_selected
+        self._apply_current_online_view()
+        self._refresh_live_views_store()
+        self._sync_live_view_form()
+        self._persist_runtime_config()
+        self._set_status(f"Deleted online view '{current_view.name}'.")
+
+    def _on_live_channel_toggled(self, _renderer: Gtk.CellRendererToggle, path: str) -> None:
+        if self._syncing_live_channel_checks:
+            return
+        current_view = self._current_online_view()
+        if current_view is None:
+            return
+        treeiter = self.live_channel_selection_store.get_iter_from_string(path)
+        if treeiter is None:
+            return
+        checked = bool(self.live_channel_selection_store[treeiter][0])
+        toggled_channel = int(self.live_channel_selection_store[treeiter][1])
+        slot_count = self._layout_slot_count(current_view.layout_id)
+        ordered_selected: list[int] = []
+        for row in self.live_channel_selection_store:
+            channel_number = int(row[1])
+            row_checked = bool(row[0])
+            if channel_number == toggled_channel:
+                row_checked = not checked
+            if row_checked:
+                ordered_selected.append(channel_number)
+        if len(ordered_selected) > slot_count:
+            self._refresh_live_channel_selection_store()
+            self._set_status(f"Grid {current_view.layout_id} accepts at most {slot_count} channels.")
+            return
+        slot_channels: list[int | None] = list(ordered_selected)
+        while len(slot_channels) < slot_count:
+            slot_channels.append(None)
+        self._replace_online_view(replace(current_view, slot_channels=slot_channels), persist=True)
+        if toggled_channel in ordered_selected:
+            self._select_live_channel(toggled_channel)
+
+    def _move_live_selection(self, step: int) -> None:
+        visible = self._visible_live_channels()
+        if not visible:
+            return
+        if self.selected_live_channel not in visible:
+            target = visible[0]
+        else:
+            current_index = visible.index(self.selected_live_channel)
+            target = visible[(current_index + step) % len(visible)]
+        self._select_live_channel(target)
+        if self.live_handle >= 0:
+            self._request_start_live_preview(target)
+
+    def _on_previous_live_channel(self, _button: Gtk.Button) -> None:
+        self._move_live_selection(-1)
+
+    def _on_next_live_channel(self, _button: Gtk.Button) -> None:
+        self._move_live_selection(1)
+
+    def _on_live_snapshots(self, _button: Gtk.Button) -> None:
+        if not self.core.get_capabilities().supports_snapshot:
+            self._set_status("Snapshot capture is not supported by the current backend yet.")
+            return
+        self._set_status("Snapshot request is not implemented yet.")
 
     def _request_start_live_grid(self) -> None:
         if not self.core.get_capabilities().supports_live:
@@ -624,8 +1138,10 @@ class MainWindow(Gtk.Window):
     def _request_stop_live_grid_cell(self, cell: LiveGridCellState) -> None:
         handle = cell.handle
         if handle < 0:
+            cell.host.set_video_active(False)
             return
         cell.handle = -1
+        cell.host.set_video_active(False)
         channel = cell.channel
         self.core.stop_live(
             session_id=handle,
@@ -653,9 +1169,11 @@ class MainWindow(Gtk.Window):
             return False
         cell = self.live_grid_cells[cell_index]
         if generation != self.live_grid_generation or not self.live_grid_enabled or cell.channel != channel or self.active_live_channel == channel:
+            cell.host.set_video_active(False)
             self.core.stop_live(session_id=handle, on_done=lambda _result: False, on_error=lambda _message: False)
             return False
         cell.handle = handle
+        cell.host.set_video_active(True)
         self._refresh_live_controls()
         return False
 
@@ -664,6 +1182,7 @@ class MainWindow(Gtk.Window):
             return False
         cell = self.live_grid_cells[cell_index]
         cell.handle = -1
+        cell.host.set_video_active(False)
         label = f"Grid error on channel {channel}: {message}" if channel is not None else f"Grid error: {message}"
         self._set_status(label)
         self._refresh_live_controls()
@@ -678,6 +1197,7 @@ class MainWindow(Gtk.Window):
     def _on_live_grid_host_ready(self, cell_index: int, xid: int) -> None:
         if 0 <= cell_index < len(self.live_grid_cells):
             self.live_grid_cells[cell_index].xid = xid
+            self.live_grid_cells[cell_index].host.set_video_active(self.live_grid_cells[cell_index].handle >= 0)
         if self.live_grid_enabled:
             self._request_start_live_grid()
         self._refresh_live_controls()
@@ -978,6 +1498,7 @@ class MainWindow(Gtk.Window):
             self.port_entry.set_text("8000")
             self.user_entry.set_text("admin")
             self._set_reports_text("Coverage and export reports will appear here.")
+            self._set_online_views([], "")
             self._refresh_live_sidebar_store()
             return
 
@@ -996,6 +1517,7 @@ class MainWindow(Gtk.Window):
             summary_text=config.last_diagnostic_summary or config.diagnostics_summary or "",
             has_changes=False,
         ))
+        self._set_online_views(list(config.online_views), config.selected_online_view_id)
 
     def _schedule_diagnostics(self) -> None:
         if self.current_runtime_config is None:
@@ -1092,7 +1614,7 @@ class MainWindow(Gtk.Window):
         current_numbers = {item.number for item in channels}
         if self.selected_live_channel not in current_numbers:
             self.selected_live_channel = channels[0].number if channels else None
-        self._refresh_live_grid_assignments()
+        self._set_online_views(self.live_views, self.selected_live_view_id)
         self._refresh_live_controls()
 
     def _try_selected_channel_from_combo(self, combo: Gtk.ComboBoxText) -> int | None:
@@ -1221,6 +1743,7 @@ class MainWindow(Gtk.Window):
 
     def _on_playback_host_ready(self, xid: int) -> None:
         self.playback_host_xid = xid
+        self.video_host.set_video_active(self.playback_handle >= 0)
         self._set_playback_info(f"Playback host ready. X11 window id={xid}")
 
     def _on_playback_host_resize(self, _xid: int, width: int, height: int) -> None:
@@ -1238,6 +1761,7 @@ class MainWindow(Gtk.Window):
 
     def _on_live_host_ready(self, xid: int) -> None:
         self.live_host_xid = xid
+        self.live_video_host.set_video_active(self.live_handle >= 0)
         self._set_live_status(f"Live host ready. X11 window id={xid}")
         if self.pending_live_focus_channel is not None and self.live_handle < 0:
             channel = self.pending_live_focus_channel
@@ -1276,11 +1800,13 @@ class MainWindow(Gtk.Window):
         handle = self.live_handle
         self.pending_live_focus_channel = None
         if handle < 0:
+            self.live_video_host.set_video_active(False)
             self._set_live_view_mode("grid")
             return
         previous_channel = self.active_live_channel
         self.live_handle = -1
         self.active_live_channel = None
+        self.live_video_host.set_video_active(False)
         self._set_live_view_mode("grid")
         self._refresh_live_controls()
         if status_text:
@@ -1333,6 +1859,7 @@ class MainWindow(Gtk.Window):
         self.live_handle = handle
         self.active_live_channel = channel
         self.pending_live_focus_channel = None
+        self.live_video_host.set_video_active(True)
         self._set_live_view_mode("focus")
         self._refresh_live_controls()
         self._set_status(f"Live focus active: channel={channel}")
@@ -1348,6 +1875,7 @@ class MainWindow(Gtk.Window):
             self.live_handle = -1
         self.active_live_channel = None
         self.pending_live_focus_channel = None
+        self.live_video_host.set_video_active(False)
         self._set_live_view_mode("grid")
         self._refresh_live_controls()
         self._set_status(f"Live error: {message}")
@@ -1379,6 +1907,7 @@ class MainWindow(Gtk.Window):
     def _request_stop_playback(self, *, status_text: str | None = None) -> None:
         handle = self.playback_handle
         if handle < 0:
+            self.video_host.set_video_active(False)
             return
         self.playback_handle = -1
         self.playback_time_poll_pending = False
@@ -1387,6 +1916,7 @@ class MainWindow(Gtk.Window):
         self.playback_position_time = None
         self.active_archive_file = None
         self.active_archive_channel = None
+        self.video_host.set_video_active(False)
         self._stop_playback_tick()
         if status_text:
             self._set_status(status_text)
@@ -1453,6 +1983,7 @@ class MainWindow(Gtk.Window):
         self.playback_handle = handle
         self.active_archive_channel = channel
         self.active_archive_file = item
+        self.video_host.set_video_active(True)
         self._anchor_playback_position(target_time, paused=False, speed_factor=1.0)
         self._ensure_playback_tick()
         self.timeline.set_cursor_time(target_time)
@@ -1470,6 +2001,7 @@ class MainWindow(Gtk.Window):
         self.playback_position_time = None
         self.active_archive_file = None
         self.active_archive_channel = None
+        self.video_host.set_video_active(False)
         self._stop_playback_tick()
         self._set_status(f"Playback error: {message}")
         self._set_playback_info(f"Ошибка воспроизведения: {message}")
@@ -1611,6 +2143,7 @@ class MainWindow(Gtk.Window):
         diagnostic_state, runtime_config = payload
         self.current_runtime_config = runtime_config
         self._set_channels(diagnostic_state.current_channels or runtime_config.channels)
+        self._set_online_views(list(runtime_config.online_views), runtime_config.selected_online_view_id)
         self._set_diagnostic_diff(diagnostic_state)
         self._set_status(
             f"Diagnostic complete: baseline={len(diagnostic_state.baseline_channels)}, "
