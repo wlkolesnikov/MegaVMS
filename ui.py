@@ -8,11 +8,12 @@ import gi
 gi.require_version("Gdk", "3.0")
 gi.require_version("Gtk", "3.0")
 gi.require_version("GLib", "2.0")
+gi.require_version("GdkPixbuf", "2.0")
 try:
     gi.require_version("GdkX11", "3.0")
 except ValueError:
     pass
-from gi.repository import Gdk, GLib, Gtk
+from gi.repository import Gdk, GdkPixbuf, GLib, Gtk
 try:
     from gi.repository import GdkX11  # type: ignore
 except ImportError:  # pragma: no cover
@@ -26,6 +27,7 @@ from contracts import (
     DiagnosticState,
     OnlineView,
     RuntimeConfig,
+    SnapshotResult,
     VideoHostBinding,
     ZoomState,
     LIVE_PROFILE_MAIN,
@@ -162,11 +164,73 @@ class X11VideoHost(Gtk.EventBox):
             self._request_blank_redraw()
 
 
+class SnapshotView(Gtk.DrawingArea):
+    def __init__(self) -> None:
+        super().__init__()
+        self._pixbuf: GdkPixbuf.Pixbuf | None = None
+        self._zoom = ZoomState(0.0, 0.0, 1.0, 1.0)
+        self.set_hexpand(True)
+        self.set_vexpand(True)
+        self.connect("draw", self._handle_draw)
+
+    @property
+    def has_snapshot(self) -> bool:
+        return self._pixbuf is not None
+
+    def set_snapshot(self, pixbuf: GdkPixbuf.Pixbuf | None) -> None:
+        self._pixbuf = pixbuf
+        self.queue_draw()
+
+    def set_zoom_state(self, zoom_state: ZoomState) -> None:
+        self._zoom = zoom_state
+        self.queue_draw()
+
+    def _handle_draw(self, _widget: Gtk.Widget, cr) -> bool:
+        allocation = self.get_allocation()
+        width = max(int(allocation.width), 1)
+        height = max(int(allocation.height), 1)
+        cr.set_source_rgb(0.02, 0.02, 0.02)
+        cr.rectangle(0, 0, width, height)
+        cr.fill()
+        if self._pixbuf is None:
+            return True
+
+        source = self._pixbuf
+        source_width = max(source.get_width(), 1)
+        source_height = max(source.get_height(), 1)
+        crop_x = max(0, min(int(self._zoom.x * source_width), source_width - 1))
+        crop_y = max(0, min(int(self._zoom.y * source_height), source_height - 1))
+        crop_width = max(1, min(int(self._zoom.width * source_width), source_width - crop_x))
+        crop_height = max(1, min(int(self._zoom.height * source_height), source_height - crop_y))
+        if crop_width != source_width or crop_height != source_height:
+            source = source.new_subpixbuf(crop_x, crop_y, crop_width, crop_height)
+            source_width = max(source.get_width(), 1)
+            source_height = max(source.get_height(), 1)
+        scale = min(width / source_width, height / source_height)
+        draw_width = max(int(source_width * scale), 1)
+        draw_height = max(int(source_height * scale), 1)
+        if draw_width == source_width and draw_height == source_height:
+            pixbuf = source
+        else:
+            pixbuf = source.scale_simple(draw_width, draw_height, GdkPixbuf.InterpType.BILINEAR)
+            if pixbuf is None:
+                pixbuf = source
+                draw_width = source_width
+                draw_height = source_height
+        offset_x = (width - draw_width) / 2.0
+        offset_y = (height - draw_height) / 2.0
+        Gdk.cairo_set_source_pixbuf(cr, pixbuf, offset_x, offset_y)
+        cr.paint()
+        return True
+
+
 @dataclass
 class LiveGridCellState:
     index: int
     frame: Gtk.Frame
+    media_stack: Gtk.Stack
     host: X11VideoHost
+    snapshot_view: SnapshotView
     title_label: Gtk.Label
     status_label: Gtk.Label
     expand_button: Gtk.Button
@@ -175,6 +239,7 @@ class LiveGridCellState:
     handle: int = -1
     resize_source_id: int = 0
     pending_size: tuple[int, int] = (0, 0)
+    snapshot_error: str = ""
 
 
 class MainWindow(Gtk.Window):
@@ -243,8 +308,21 @@ class MainWindow(Gtk.Window):
         self.live_grid_cells: list[LiveGridCellState] = []
         self.live_focus_resize_source_id = 0
         self.live_focus_pending_size: tuple[int, int] = (0, 0)
+        self.live_focus_zoom = ZoomState(0.0, 0.0, 1.0, 1.0)
+        self.live_focus_dragging = False
+        self.live_focus_drag_start_x = 0.0
+        self.live_focus_drag_start_y = 0.0
+        self.live_focus_zoom_start_x = 0.0
+        self.live_focus_zoom_start_y = 0.0
+        self.live_focus_snapshot_request_pending = False
+        self.live_focus_snapshot_refresh_source_id = 0
+        self.live_focus_snapshot_generation = 0
         self._syncing_live_channel_checks = False
         self._suppress_live_view_selection = False
+        self.live_snapshot_generation = 0
+        self.live_snapshot_pending = 0
+        self.live_snapshot_success = 0
+        self.live_snapshot_failed = 0
         self.playback_paused = False
         self.playback_speed_factor = 1.0
         self.playback_position_time: datetime | None = None
@@ -337,8 +415,8 @@ class MainWindow(Gtk.Window):
         toolbar.pack_start(self.live_toolbar_status_label, True, True, 0)
 
         self.live_stack = Gtk.Stack()
-        self.live_stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        self.live_stack.set_transition_duration(180)
+        self.live_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+        self.live_stack.set_transition_duration(0)
         self.live_stack.add_named(self._build_live_grid_view(), "grid")
         self.live_stack.add_named(self._build_live_focus_view(), "focus")
         outer.pack_start(self.live_stack, True, True, 0)
@@ -495,6 +573,13 @@ class MainWindow(Gtk.Window):
                 on_click=lambda event, cell_index=index: self._on_live_grid_tile_click(cell_index, event),
             )
             host.set_size_request(-1, -1)
+            snapshot_view = SnapshotView()
+            media_stack = Gtk.Stack()
+            media_stack.set_transition_type(Gtk.StackTransitionType.NONE)
+            media_stack.set_transition_duration(0)
+            media_stack.add_named(host, "video")
+            media_stack.add_named(snapshot_view, "snapshot")
+            media_stack.set_visible_child_name("video")
             tile_aspect = Gtk.AspectFrame(
                 xalign=0.5,
                 yalign=0.5,
@@ -503,7 +588,7 @@ class MainWindow(Gtk.Window):
             )
             tile_aspect.set_hexpand(True)
             tile_aspect.set_vexpand(True)
-            tile_aspect.add(host)
+            tile_aspect.add(media_stack)
             overlay.add(tile_aspect)
 
             title_label = Gtk.Label(label=f"Slot {index + 1}", xalign=0.0)
@@ -544,7 +629,9 @@ class MainWindow(Gtk.Window):
                 LiveGridCellState(
                     index=index,
                     frame=cell_frame,
+                    media_stack=media_stack,
                     host=host,
+                    snapshot_view=snapshot_view,
                     title_label=title_label,
                     status_label=status_label,
                     expand_button=expand_button,
@@ -554,72 +641,68 @@ class MainWindow(Gtk.Window):
         return frame
 
     def _build_live_focus_view(self) -> Gtk.Widget:
-        container = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=8)
-
-        header = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        container.pack_start(header, False, False, 0)
-
-        self.live_back_button = Gtk.Button(label="Back To Grid")
-        self.live_back_button.connect("clicked", self._on_stop_live)
-        header.pack_start(self.live_back_button, False, False, 0)
-
-        self.live_focus_camera_label = Gtk.Label(label="No camera selected", xalign=0.0)
-        header.pack_start(self.live_focus_camera_label, False, False, 0)
-
-        self.live_focus_profile_label = Gtk.Label(label="Profile: Main stream", xalign=0.0)
-        header.pack_start(self.live_focus_profile_label, False, False, 12)
-
-        focus_paned = Gtk.Paned(orientation=Gtk.Orientation.HORIZONTAL)
-        container.pack_start(focus_paned, True, True, 0)
-
         focus_frame = Gtk.Frame(label="Focus View")
-        focus_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        focus_box.set_border_width(8)
-        focus_frame.add(focus_box)
+        overlay = Gtk.Overlay()
+        focus_frame.add(overlay)
 
         self.live_video_host = X11VideoHost(
             on_ready=self._on_live_host_ready,
             on_resize=self._on_live_host_resize,
+            on_drag_start=self._on_live_focus_drag_start,
+            on_drag_motion=self._on_live_focus_drag_motion,
+            on_drag_end=self._on_live_focus_drag_end,
+            on_zoom_wheel=self._on_live_focus_zoom_wheel,
+            on_click=self._on_live_focus_click,
         )
-        focus_box.pack_start(self.live_video_host, True, True, 0)
+        overlay.add(self.live_video_host)
 
-        self.live_status_label = Gtk.Label(
-            label="Live focus is not started.",
-            xalign=0.0,
-        )
+        self.live_focus_snapshot_view = SnapshotView()
+        self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
+        self.live_focus_snapshot_view.hide()
+        overlay.add_overlay(self.live_focus_snapshot_view)
+        overlay.set_overlay_pass_through(self.live_focus_snapshot_view, True)
+
+        header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        header_box.set_halign(Gtk.Align.FILL)
+        header_box.set_valign(Gtk.Align.START)
+        header_box.set_margin_top(12)
+        header_box.set_margin_start(12)
+        header_box.set_margin_end(12)
+
+        self.live_focus_camera_label = Gtk.Label(label="No camera selected", xalign=0.0)
+        self.live_focus_camera_label.get_style_context().add_class("live-grid-overlay")
+        self._force_transparent(self.live_focus_camera_label)
+        header_box.pack_start(self.live_focus_camera_label, False, False, 0)
+
+        self.live_focus_profile_label = Gtk.Label(label="Profile: Main stream", xalign=0.0)
+        self.live_focus_profile_label.get_style_context().add_class("live-grid-overlay")
+        self._force_transparent(self.live_focus_profile_label)
+        header_box.pack_start(self.live_focus_profile_label, False, False, 0)
+        overlay.add_overlay(header_box)
+
+        self.live_status_label = Gtk.Label(label="Live focus is not started.", xalign=0.0)
+        self.live_status_label.get_style_context().add_class("live-grid-overlay")
         self.live_status_label.set_line_wrap(True)
-        focus_box.pack_start(self.live_status_label, False, False, 0)
-        focus_paned.pack1(focus_frame, resize=True, shrink=False)
+        self._force_transparent(self.live_status_label)
+        status_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        status_box.set_halign(Gtk.Align.START)
+        status_box.set_valign(Gtk.Align.END)
+        status_box.set_margin_start(12)
+        status_box.set_margin_end(12)
+        status_box.set_margin_bottom(12)
+        status_box.pack_start(self.live_status_label, False, False, 0)
+        overlay.add_overlay(status_box)
 
-        sidebar_frame = Gtk.Frame(label="Cameras")
-        sidebar_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
-        sidebar_box.set_border_width(8)
-        sidebar_frame.add(sidebar_box)
+        focus_hint_label = Gtk.Label(label="Double-click the camera to return to grid.", xalign=1.0)
+        focus_hint_label.get_style_context().add_class("live-grid-overlay")
+        focus_hint_label.set_halign(Gtk.Align.END)
+        focus_hint_label.set_valign(Gtk.Align.END)
+        focus_hint_label.set_margin_end(12)
+        focus_hint_label.set_margin_bottom(12)
+        self._force_transparent(focus_hint_label)
+        overlay.add_overlay(focus_hint_label)
 
-        self.live_sidebar_store = Gtk.ListStore(int, str, str)
-        self.live_sidebar_tree = Gtk.TreeView(model=self.live_sidebar_store)
-        self.live_sidebar_tree.get_selection().connect("changed", self._on_live_sidebar_selection_changed)
-        self.live_sidebar_tree.connect("row-activated", self._on_live_sidebar_row_activated)
-        for index, title in enumerate(("Channel", "Name", "Status")):
-            renderer = Gtk.CellRendererText()
-            column = Gtk.TreeViewColumn(title, renderer, text=index)
-            column.set_resizable(True)
-            self.live_sidebar_tree.append_column(column)
-        sidebar_scroll = Gtk.ScrolledWindow()
-        sidebar_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
-        sidebar_scroll.set_min_content_width(300)
-        sidebar_scroll.add(self.live_sidebar_tree)
-        sidebar_box.pack_start(sidebar_scroll, True, True, 0)
-
-        self.live_sidebar_hint_label = Gtk.Label(
-            label="Double-click a camera in grid or sidebar to open focus.",
-            xalign=0.0,
-        )
-        self.live_sidebar_hint_label.set_line_wrap(True)
-        sidebar_box.pack_start(self.live_sidebar_hint_label, False, False, 0)
-        focus_paned.pack2(sidebar_frame, resize=False, shrink=False)
-
-        return container
+        return focus_frame
 
     @classmethod
     def _layout_dimensions(cls, layout_id: str) -> tuple[int, int]:
@@ -882,6 +965,151 @@ class MainWindow(Gtk.Window):
                 return channel
         return None
 
+    @staticmethod
+    def _is_default_zoom(zoom_state: ZoomState) -> bool:
+        return (
+            abs(zoom_state.x) < 1e-6
+            and abs(zoom_state.y) < 1e-6
+            and abs(zoom_state.width - 1.0) < 1e-6
+            and abs(zoom_state.height - 1.0) < 1e-6
+        )
+
+    @staticmethod
+    def _clamp_zoom_state(zoom_state: ZoomState) -> ZoomState:
+        width = max(0.1, min(float(zoom_state.width), 1.0))
+        height = max(0.1, min(float(zoom_state.height), 1.0))
+        x = max(0.0, min(float(zoom_state.x), 1.0 - width))
+        y = max(0.0, min(float(zoom_state.y), 1.0 - height))
+        return ZoomState(x, y, width, height)
+
+    def _reset_live_focus_zoom(self) -> None:
+        self.live_focus_zoom = ZoomState(0.0, 0.0, 1.0, 1.0)
+        self.live_focus_dragging = False
+        self.live_focus_snapshot_request_pending = False
+        self.live_focus_snapshot_generation += 1
+        if self.live_focus_snapshot_refresh_source_id != 0:
+            GLib.source_remove(self.live_focus_snapshot_refresh_source_id)
+            self.live_focus_snapshot_refresh_source_id = 0
+        if hasattr(self, "live_focus_snapshot_view"):
+            self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
+            self.live_focus_snapshot_view.set_snapshot(None)
+            self.live_focus_snapshot_view.hide()
+
+    def _apply_live_focus_zoom_overlay(self) -> None:
+        if not hasattr(self, "live_focus_snapshot_view"):
+            return
+        self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
+        if self._is_default_zoom(self.live_focus_zoom):
+            self.live_focus_snapshot_view.set_snapshot(None)
+            self.live_focus_snapshot_view.hide()
+            if self.live_focus_snapshot_refresh_source_id != 0:
+                GLib.source_remove(self.live_focus_snapshot_refresh_source_id)
+                self.live_focus_snapshot_refresh_source_id = 0
+            self.live_focus_snapshot_request_pending = False
+            self.live_focus_snapshot_generation += 1
+            return
+        self.live_focus_snapshot_view.show()
+        if self.live_focus_snapshot_refresh_source_id == 0:
+            self.live_focus_snapshot_refresh_source_id = GLib.timeout_add(
+                400,
+                self._refresh_live_focus_snapshot_tick,
+            )
+        self._request_live_focus_snapshot()
+
+    def _refresh_live_focus_snapshot_tick(self) -> bool:
+        if self.live_handle < 0 or self.active_live_channel is None or self._is_default_zoom(self.live_focus_zoom):
+            self.live_focus_snapshot_refresh_source_id = 0
+            return False
+        self._request_live_focus_snapshot()
+        return True
+
+    def _request_live_focus_snapshot(self) -> None:
+        channel = self.active_live_channel
+        if channel is None or self.live_handle < 0 or self.live_focus_snapshot_request_pending:
+            return
+        if not self.core.get_capabilities().supports_snapshot:
+            return
+        self.live_focus_snapshot_request_pending = True
+        generation = self.live_focus_snapshot_generation
+        self.core.request_live_snapshot(
+            channel=channel,
+            on_done=lambda result, gen=generation: self._handle_live_focus_snapshot_done(gen, result),
+            on_error=lambda message, channel_id=channel, gen=generation: self._handle_live_focus_snapshot_error(gen, channel_id, message),
+        )
+
+    def _handle_live_focus_snapshot_done(self, generation: int, result: SnapshotResult) -> bool:
+        if generation != self.live_focus_snapshot_generation:
+            return False
+        self.live_focus_snapshot_request_pending = False
+        if self.live_handle < 0 or self.active_live_channel != result.channel or self._is_default_zoom(self.live_focus_zoom):
+            return False
+        try:
+            pixbuf = self._decode_snapshot_pixbuf(result.image_bytes)
+        except Exception as exc:
+            return self._handle_live_focus_snapshot_error(generation, result.channel, str(exc))
+        self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
+        self.live_focus_snapshot_view.set_snapshot(pixbuf)
+        self.live_focus_snapshot_view.show()
+        return False
+
+    def _handle_live_focus_snapshot_error(self, generation: int, channel: int, message: str) -> bool:
+        if generation != self.live_focus_snapshot_generation:
+            return False
+        self.live_focus_snapshot_request_pending = False
+        if self.active_live_channel == channel and not self._is_default_zoom(self.live_focus_zoom):
+            self._set_live_status(f"Live focus zoom snapshot error: {message}")
+        return False
+
+    @staticmethod
+    def _decode_snapshot_pixbuf(image_bytes: bytes) -> GdkPixbuf.Pixbuf:
+        loader = GdkPixbuf.PixbufLoader.new_with_type("jpeg")
+        try:
+            loader.write(image_bytes)
+            loader.close()
+            pixbuf = loader.get_pixbuf()
+        except Exception as exc:
+            raise RuntimeError(f"Snapshot decode failed: {exc}") from exc
+        if pixbuf is None:
+            raise RuntimeError("Snapshot decode failed: empty pixbuf")
+        return pixbuf
+
+    @staticmethod
+    def _cell_has_snapshot(cell: LiveGridCellState) -> bool:
+        return cell.snapshot_view.has_snapshot
+
+    def _clear_live_grid_snapshot(self, cell: LiveGridCellState) -> None:
+        cell.snapshot_view.set_snapshot(None)
+        cell.snapshot_error = ""
+        self._refresh_live_grid_cell_media(cell)
+
+    def _set_live_grid_snapshot(self, channel: int, image_bytes: bytes) -> None:
+        cell = self._find_live_grid_cell(channel)
+        if cell is None:
+            return
+        pixbuf = self._decode_snapshot_pixbuf(image_bytes)
+        cell.snapshot_view.set_snapshot(pixbuf)
+        cell.snapshot_error = ""
+        self._refresh_live_grid_cell_media(cell)
+
+    def _set_live_grid_snapshot_error(self, channel: int, message: str) -> None:
+        cell = self._find_live_grid_cell(channel)
+        if cell is None:
+            return
+        cell.snapshot_view.set_snapshot(None)
+        cell.snapshot_error = message
+        self._refresh_live_grid_cell_media(cell)
+
+    def _refresh_live_grid_cell_media(self, cell: LiveGridCellState) -> None:
+        if cell.handle >= 0:
+            cell.media_stack.set_visible_child_name("video")
+            cell.host.set_video_active(True)
+            return
+        if self._cell_has_snapshot(cell):
+            cell.media_stack.set_visible_child_name("snapshot")
+        else:
+            cell.media_stack.set_visible_child_name("video")
+        cell.host.set_video_active(False)
+
     def _refresh_live_grid_assignments(self) -> None:
         current_view = self._current_online_view()
         slot_channels = current_view.slot_channels if current_view is not None else []
@@ -893,13 +1121,15 @@ class MainWindow(Gtk.Window):
             assigned_number = assigned.number if assigned is not None else None
             if cell.handle >= 0 and cell.channel != assigned_number:
                 self._request_stop_live_grid_cell(cell)
+            if cell.channel != assigned_number:
+                self._clear_live_grid_snapshot(cell)
             cell.channel = assigned_number
             if assigned is None:
-                cell.host.set_video_active(False)
                 cell.title_label.set_text(f"Slot {index + 1}")
                 cell.status_label.set_text("Empty slot" if index < slot_count else "Hidden slot")
                 cell.expand_button.set_sensitive(False)
                 cell.frame.set_shadow_type(Gtk.ShadowType.OUT)
+                self._refresh_live_grid_cell_media(cell)
                 continue
             cell.title_label.set_text(f"CH {assigned.number} | {assigned.name}")
             status_text = assigned.status_text
@@ -907,6 +1137,10 @@ class MainWindow(Gtk.Window):
                 cell.status_label.set_text(f"Focus active | {status_text}")
             elif cell.handle >= 0:
                 cell.status_label.set_text(f"Live grid active | {status_text}")
+            elif self._cell_has_snapshot(cell):
+                cell.status_label.set_text(f"Snapshot ready | {status_text}")
+            elif cell.snapshot_error:
+                cell.status_label.set_text(f"Snapshot error | {status_text}")
             elif self.live_grid_enabled:
                 cell.status_label.set_text(f"Starting stream | {status_text}")
             else:
@@ -914,6 +1148,7 @@ class MainWindow(Gtk.Window):
             cell.expand_button.set_sensitive(self.live_host_xid > 0)
             is_selected = self.selected_live_channel == assigned.number
             cell.frame.set_shadow_type(Gtk.ShadowType.IN if is_selected else Gtk.ShadowType.OUT)
+            self._refresh_live_grid_cell_media(cell)
 
     def _refresh_live_controls(self) -> None:
         supports_live = self.core.get_capabilities().supports_live
@@ -1102,7 +1337,59 @@ class MainWindow(Gtk.Window):
         if not self.core.get_capabilities().supports_snapshot:
             self._set_status("Snapshot capture is not supported by the current backend yet.")
             return
-        self._set_status("Snapshot request is not implemented yet.")
+        channels = self._visible_live_channels()
+        if not channels:
+            self._set_status("No channels assigned to the current view.")
+            return
+        if self._has_active_live():
+            self._request_stop_all_live(status_text="Stopping live sessions before snapshot capture...")
+        self.live_snapshot_generation += 1
+        generation = self.live_snapshot_generation
+        self.live_snapshot_pending = len(channels)
+        self.live_snapshot_success = 0
+        self.live_snapshot_failed = 0
+        for cell in self.live_grid_cells:
+            if cell.channel in channels:
+                cell.snapshot_error = ""
+        self._set_status(f"Requesting snapshots for {len(channels)} channel(s)...")
+        self._refresh_live_grid_assignments()
+        for channel in channels:
+            self.core.request_live_snapshot(
+                channel=channel,
+                on_done=lambda result, gen=generation: self._handle_live_snapshot_done(gen, result),
+                on_error=lambda message, channel_id=channel, gen=generation: self._handle_live_snapshot_error(gen, channel_id, message),
+            )
+
+    def _handle_live_snapshot_done(self, generation: int, result: SnapshotResult) -> bool:
+        if generation != self.live_snapshot_generation:
+            return False
+        try:
+            self._set_live_grid_snapshot(result.channel, result.image_bytes)
+        except Exception as exc:
+            return self._handle_live_snapshot_error(generation, result.channel, str(exc))
+        self.live_snapshot_pending = max(self.live_snapshot_pending - 1, 0)
+        self.live_snapshot_success += 1
+        self._refresh_live_grid_assignments()
+        if self.live_snapshot_pending == 0:
+            self._set_status(
+                f"Snapshots ready: {self.live_snapshot_success} ok, {self.live_snapshot_failed} failed."
+            )
+        return False
+
+    def _handle_live_snapshot_error(self, generation: int, channel: int, message: str) -> bool:
+        if generation != self.live_snapshot_generation:
+            return False
+        self._set_live_grid_snapshot_error(channel, message)
+        self.live_snapshot_pending = max(self.live_snapshot_pending - 1, 0)
+        self.live_snapshot_failed += 1
+        self._refresh_live_grid_assignments()
+        if self.live_snapshot_pending == 0:
+            self._set_status(
+                f"Snapshots ready: {self.live_snapshot_success} ok, {self.live_snapshot_failed} failed."
+            )
+        else:
+            self._set_status(f"Snapshot failed for channel {channel}: {message}")
+        return False
 
     def _request_start_live_grid(self) -> None:
         if not self.core.get_capabilities().supports_live:
@@ -1242,6 +1529,68 @@ class MainWindow(Gtk.Window):
         self._select_live_channel(cell.channel)
         if event.type == Gdk.EventType._2BUTTON_PRESS and cell.channel is not None:
             self._request_start_live_preview(cell.channel)
+
+    def _on_live_focus_click(self, event: Gdk.EventButton) -> None:
+        if event.type == Gdk.EventType._2BUTTON_PRESS:
+            self._request_stop_live_preview(status_text="Returning focused channel to grid...")
+
+    def _on_live_focus_drag_start(self, x: float, y: float) -> None:
+        if self.live_handle < 0 or self._is_default_zoom(self.live_focus_zoom):
+            return
+        self.live_focus_dragging = True
+        self.live_focus_drag_start_x = x
+        self.live_focus_drag_start_y = y
+        self.live_focus_zoom_start_x = self.live_focus_zoom.x
+        self.live_focus_zoom_start_y = self.live_focus_zoom.y
+
+    def _on_live_focus_drag_motion(self, x: float, y: float) -> None:
+        if self.live_handle < 0 or not self.live_focus_dragging:
+            return
+        allocation = self.live_video_host.get_allocation()
+        widget_width = allocation.width
+        widget_height = allocation.height
+        if widget_width <= 0 or widget_height <= 0:
+            return
+        delta_x = (x - self.live_focus_drag_start_x) / widget_width
+        delta_y = (y - self.live_focus_drag_start_y) / widget_height
+        new_zoom = self._clamp_zoom_state(
+            ZoomState(
+                self.live_focus_zoom_start_x - delta_x * self.live_focus_zoom.width,
+                self.live_focus_zoom_start_y - delta_y * self.live_focus_zoom.height,
+                self.live_focus_zoom.width,
+                self.live_focus_zoom.height,
+            )
+        )
+        self.live_focus_zoom = new_zoom
+        self._apply_live_focus_zoom_overlay()
+
+    def _on_live_focus_drag_end(self, _x: float, _y: float) -> None:
+        self.live_focus_dragging = False
+
+    def _on_live_focus_zoom_wheel(self, x: float, y: float, direction: int) -> None:
+        if self.live_handle < 0:
+            return
+        allocation = self.live_video_host.get_allocation()
+        widget_width = allocation.width
+        widget_height = allocation.height
+        if widget_width <= 0 or widget_height <= 0:
+            return
+        factor = 1.1 if direction > 0 else 0.9
+        rel_x = max(0.0, min(x / widget_width, 1.0))
+        rel_y = max(0.0, min(y / widget_height, 1.0))
+        current = self.live_focus_zoom
+        new_w = min(max(current.width * factor, 0.1), 1.0)
+        new_h = min(max(current.height * factor, 0.1), 1.0)
+        new_zoom = self._clamp_zoom_state(
+            ZoomState(
+                current.x + (current.width - new_w) * rel_x,
+                current.y + (current.height - new_h) * rel_y,
+                new_w,
+                new_h,
+            )
+        )
+        self.live_focus_zoom = new_zoom
+        self._apply_live_focus_zoom_overlay()
 
     def _on_focus_grid_cell(self, cell_index: int) -> None:
         if cell_index < 0 or cell_index >= len(self.live_grid_cells):
@@ -1799,6 +2148,7 @@ class MainWindow(Gtk.Window):
     def _request_stop_live_preview(self, *, status_text: str | None = None, restart_grid: bool = True) -> None:
         handle = self.live_handle
         self.pending_live_focus_channel = None
+        self._reset_live_focus_zoom()
         if handle < 0:
             self.live_video_host.set_video_active(False)
             self._set_live_view_mode("grid")
@@ -1823,6 +2173,7 @@ class MainWindow(Gtk.Window):
     def _request_start_live_preview(self, channel: int) -> None:
         self._select_live_channel(channel)
         self._set_live_view_mode("focus")
+        self._reset_live_focus_zoom()
         if self.live_host_xid <= 0:
             self.pending_live_focus_channel = channel
             self._set_status("Preparing focus view...")
@@ -1859,6 +2210,7 @@ class MainWindow(Gtk.Window):
         self.live_handle = handle
         self.active_live_channel = channel
         self.pending_live_focus_channel = None
+        self._reset_live_focus_zoom()
         self.live_video_host.set_video_active(True)
         self._set_live_view_mode("focus")
         self._refresh_live_controls()
@@ -1875,6 +2227,7 @@ class MainWindow(Gtk.Window):
             self.live_handle = -1
         self.active_live_channel = None
         self.pending_live_focus_channel = None
+        self._reset_live_focus_zoom()
         self.live_video_host.set_video_active(False)
         self._set_live_view_mode("grid")
         self._refresh_live_controls()
@@ -2405,6 +2758,9 @@ class MainWindow(Gtk.Window):
         if self.live_focus_resize_source_id != 0:
             GLib.source_remove(self.live_focus_resize_source_id)
             self.live_focus_resize_source_id = 0
+        if self.live_focus_snapshot_refresh_source_id != 0:
+            GLib.source_remove(self.live_focus_snapshot_refresh_source_id)
+            self.live_focus_snapshot_refresh_source_id = 0
         for cell in self.live_grid_cells:
             if cell.resize_source_id != 0:
                 GLib.source_remove(cell.resize_source_id)

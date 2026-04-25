@@ -230,6 +230,13 @@ class ArchiveCoverageReport:
         return "\n".join(lines)
 
 
+@dataclass(frozen=True)
+class SnapshotResult:
+    channel: int
+    image_bytes: bytes
+    captured_at: str
+
+
 def runtime_config_to_dict(config: RuntimeConfig) -> dict[str, Any]:
     return {
         "plugin_name": config.plugin_name,

@@ -9,6 +9,7 @@ import os
 import threading
 from pathlib import Path
 import sys
+import tempfile
 
 from contracts import (
     ArchiveCoverageReport,
@@ -19,6 +20,7 @@ from contracts import (
     DiagnosticReport,
     PluginCapabilities,
     RuntimeConfig,
+    SnapshotResult,
     StreamProfile,
     VideoHostBinding,
     ZoomState,
@@ -148,6 +150,13 @@ class NET_DVR_IPCHANINFO_V40(ctypes.Structure):
         ("byFactoryType", ctypes.c_ubyte),
         ("byRes", ctypes.c_ubyte),
         ("strURL", ctypes.c_ubyte * URL_LEN),
+    ]
+
+
+class NET_DVR_JPEGPARA(ctypes.Structure):
+    _fields_ = [
+        ("wPicSize", ctypes.c_uint16),
+        ("wPicQuality", ctypes.c_uint16),
     ]
 
 
@@ -847,7 +856,7 @@ class HikvisionPlugin:
             supports_rate_control=True,
             supports_frame_step=True,
             supports_native_zoom=True,
-            supports_snapshot=False,
+            supports_snapshot=supports_live,
             supports_diagnostics=True,
             supports_archive_coverage_report=True,
         )
@@ -935,6 +944,87 @@ class HikvisionPlugin:
         if sdk_obj is None:
             raise RuntimeError("hcnetsdk library not available")
         return sdk_obj
+
+    def _get_last_sdk_error(self, hcnetsdk) -> int:
+        if not hasattr(hcnetsdk, "NET_DVR_GetLastError"):
+            return -1
+        try:
+            return int(hcnetsdk.NET_DVR_GetLastError())
+        except Exception:
+            return -1
+
+    def _snapshot_jpeg_params(self) -> NET_DVR_JPEGPARA:
+        params = NET_DVR_JPEGPARA()
+        params.wPicSize = 0xFF
+        params.wPicQuality = 1
+        return params
+
+    def _capture_jpeg_to_memory(self, *, user_id: int, channel: int) -> bytes | None:
+        hcnetsdk = self._resolve_sdk_library()
+        if not hasattr(hcnetsdk, "NET_DVR_CaptureJPEGPicture_NEW"):
+            return None
+
+        hcnetsdk.NET_DVR_CaptureJPEGPicture_NEW.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(NET_DVR_JPEGPARA),
+            ctypes.c_void_p,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_uint32),
+        ]
+        hcnetsdk.NET_DVR_CaptureJPEGPicture_NEW.restype = ctypes.c_bool
+
+        jpeg_params = self._snapshot_jpeg_params()
+        for buffer_size in (1 * 1024 * 1024, 4 * 1024 * 1024, 8 * 1024 * 1024, 16 * 1024 * 1024):
+            buffer = ctypes.create_string_buffer(buffer_size)
+            size_returned = ctypes.c_uint32(0)
+            with self.service._sdk_lock:
+                ok = hcnetsdk.NET_DVR_CaptureJPEGPicture_NEW(
+                    int(user_id),
+                    int(channel),
+                    ctypes.byref(jpeg_params),
+                    ctypes.cast(buffer, ctypes.c_void_p),
+                    ctypes.c_uint32(buffer_size),
+                    ctypes.byref(size_returned),
+                )
+            if ok and size_returned.value > 0:
+                return bytes(buffer.raw[: size_returned.value])
+        return None
+
+    def _capture_jpeg_to_file(self, *, user_id: int, channel: int) -> bytes:
+        hcnetsdk = self._resolve_sdk_library()
+        if not hasattr(hcnetsdk, "NET_DVR_CaptureJPEGPicture"):
+            raise RuntimeError("NET_DVR_CaptureJPEGPicture is not available")
+
+        hcnetsdk.NET_DVR_CaptureJPEGPicture.argtypes = [
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.POINTER(NET_DVR_JPEGPARA),
+            ctypes.c_char_p,
+        ]
+        hcnetsdk.NET_DVR_CaptureJPEGPicture.restype = ctypes.c_bool
+
+        jpeg_params = self._snapshot_jpeg_params()
+        temp_file = tempfile.NamedTemporaryFile(prefix="hik-snapshot-", suffix=".jpg", delete=False)
+        temp_path = temp_file.name
+        temp_file.close()
+        try:
+            with self.service._sdk_lock:
+                ok = hcnetsdk.NET_DVR_CaptureJPEGPicture(
+                    int(user_id),
+                    int(channel),
+                    ctypes.byref(jpeg_params),
+                    temp_path.encode("utf-8"),
+                )
+            if not ok:
+                error_code = self._get_last_sdk_error(hcnetsdk)
+                raise RuntimeError(f"NET_DVR_CaptureJPEGPicture failed: error={error_code}")
+            return Path(temp_path).read_bytes()
+        finally:
+            try:
+                Path(temp_path).unlink(missing_ok=True)
+            except Exception:
+                pass
 
     def _start_real_preview(
         self,
@@ -1072,6 +1162,26 @@ class HikvisionPlugin:
 
     def stop_live_preview(self, handle: int) -> None:
         self.stop_live(handle)
+
+    def request_live_snapshot(self, channel: int) -> SnapshotResult:
+        self.ensure_connected()
+        if self.service.mode != "real" or self.service.device is None:
+            raise RuntimeError("Snapshot capture is available only in real mode")
+        user_id = int(getattr(self.service.device, "user_id", -1))
+        if user_id < 0:
+            raise RuntimeError("Unable to get user_id from device")
+
+        image_bytes = self._capture_jpeg_to_memory(user_id=user_id, channel=channel)
+        if not image_bytes:
+            image_bytes = self._capture_jpeg_to_file(user_id=user_id, channel=channel)
+        if not image_bytes:
+            raise RuntimeError("Snapshot capture returned empty image data")
+
+        return SnapshotResult(
+            channel=int(channel),
+            image_bytes=image_bytes,
+            captured_at=datetime.now().isoformat(timespec="seconds"),
+        )
 
     def resize_surface(
         self,

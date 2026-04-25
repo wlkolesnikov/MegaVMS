@@ -16,6 +16,7 @@ from contracts import (
     ConnectionParams,
     DiagnosticState,
     RuntimeConfig,
+    SnapshotResult,
     StreamProfile,
     VideoHostBinding,
     ZoomState,
@@ -501,6 +502,19 @@ class ApplicationCore:
     ) -> Future[Any]:
         return self._submit(
             lambda: self.plugin.get_archive_playback_time(handle),
+            on_done,
+            on_error,
+        )
+
+    def request_live_snapshot(
+        self,
+        *,
+        channel: int,
+        on_done: Callable[[SnapshotResult], None],
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        return self._submit(
+            lambda: self.plugin.request_live_snapshot(channel),
             on_done,
             on_error,
         )
