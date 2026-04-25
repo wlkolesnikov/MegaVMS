@@ -29,9 +29,6 @@ from contracts import (
     ZoomState,
 )
 
-from hikvision_sdk.exceptions import LoginError  # type: ignore  # noqa: E402
-
-
 logger = logging.getLogger(__name__)
 DEFAULT_LIB_DIR = Path(os.environ.get("HIKVISION_LIB_DIR", Path.home() / ".local/lib/hikvision"))
 
@@ -72,6 +69,110 @@ SDK_ERROR_MESSAGES = {
     ),
 }
 
+LONG = ctypes.c_long
+DWORD = ctypes.c_uint32
+WORD = ctypes.c_uint16
+BYTE = ctypes.c_ubyte
+HWND = ctypes.c_void_p
+BOOL = ctypes.c_int
+REALDATACALLBACK = ctypes.CFUNCTYPE(None, LONG, DWORD, ctypes.POINTER(BYTE), DWORD, ctypes.c_void_p)
+
+
+class SDKLoginError(RuntimeError):
+    def __init__(self, error_code: int, message: str | None = None) -> None:
+        self.error_code = int(error_code)
+        super().__init__(message or f"HCNetSDK login failed: error={self.error_code}")
+
+
+class NET_DVR_STREAM_INFO(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", DWORD),
+        ("byID", BYTE * 32),
+        ("dwChannel", DWORD),
+        ("byRes", BYTE * 32),
+    ]
+
+
+class NET_DVR_DEVICEINFO_V30(ctypes.Structure):
+    _fields_ = [
+        ("sSerialNumber", BYTE * 48),
+        ("byAlarmInPortNum", BYTE),
+        ("byAlarmOutPortNum", BYTE),
+        ("byDiskNum", BYTE),
+        ("byDVRType", BYTE),
+        ("byChanNum", BYTE),
+        ("byStartChan", BYTE),
+        ("byAudioChanNum", BYTE),
+        ("byIPChanNum", BYTE),
+        ("byZeroChanNum", BYTE),
+        ("byMainProto", BYTE),
+        ("bySubProto", BYTE),
+        ("bySupport", BYTE),
+        ("bySupport1", BYTE),
+        ("bySupport2", BYTE),
+        ("wDevType", WORD),
+        ("bySupport3", BYTE),
+        ("byMultiStreamProto", BYTE),
+        ("byStartDChan", BYTE),
+        ("byStartDTalkChan", BYTE),
+        ("byHighDChanNum", BYTE),
+        ("bySupport4", BYTE),
+        ("byLanguageType", BYTE),
+        ("byVoiceInChanNum", BYTE),
+        ("byStartVoiceInChanNo", BYTE),
+        ("bySupport5", BYTE),
+        ("bySupport6", BYTE),
+        ("byMirrorChanNum", BYTE),
+        ("wStartMirrorChanNo", WORD),
+        ("bySupport7", BYTE),
+        ("byRes2", BYTE),
+    ]
+
+
+class NET_DVR_DEVICEINFO_V40(ctypes.Structure):
+    _fields_ = [
+        ("struDeviceV30", NET_DVR_DEVICEINFO_V30),
+        ("bySupportLock", BYTE),
+        ("byRetryLoginTime", BYTE),
+        ("byPasswordLevel", BYTE),
+        ("byProxyType", BYTE),
+        ("dwSurplusLockTime", DWORD),
+        ("byCharEncodeType", BYTE),
+        ("bySupportDev5", BYTE),
+        ("bySupport", BYTE),
+        ("byLoginMode", BYTE),
+        ("dwOEMCode", DWORD),
+        ("iResidualValidity", ctypes.c_int),
+        ("byResidualValidity", BYTE),
+        ("bySingleStartDTalkChan", BYTE),
+        ("bySingleDTalkChanNums", BYTE),
+        ("byPassWordResetLevel", BYTE),
+        ("bySupportStreamEncrypt", BYTE),
+        ("byMarketType", BYTE),
+        ("byTLSCap", BYTE),
+        ("byRes2", BYTE * 237),
+    ]
+
+
+class NET_DVR_USER_LOGIN_INFO(ctypes.Structure):
+    _fields_ = [
+        ("sDeviceAddress", ctypes.c_char * 129),
+        ("byUseTransport", BYTE),
+        ("wPort", WORD),
+        ("sUserName", ctypes.c_char * 64),
+        ("sPassword", ctypes.c_char * 64),
+        ("cbLoginResult", ctypes.c_void_p),
+        ("pUser", ctypes.c_void_p),
+        ("bUseAsynLogin", BOOL),
+        ("byProxyType", BYTE),
+        ("byUseUTCTime", BYTE),
+        ("byLoginMode", BYTE),
+        ("byHttps", BYTE),
+        ("iProxyID", LONG),
+        ("byVerifyMode", BYTE),
+        ("byRes3", BYTE * 119),
+    ]
+
 
 class NET_DVR_TIME(ctypes.Structure):
     _fields_ = [
@@ -81,6 +182,31 @@ class NET_DVR_TIME(ctypes.Structure):
         ("dwHour", ctypes.c_uint32),
         ("dwMinute", ctypes.c_uint32),
         ("dwSecond", ctypes.c_uint32),
+    ]
+
+
+class NET_DVR_FILECOND(ctypes.Structure):
+    _fields_ = [
+        ("lChannel", LONG),
+        ("dwFileType", DWORD),
+        ("dwIsLocked", DWORD),
+        ("dwUseCardNo", DWORD),
+        ("sCardNumber", ctypes.c_char * 32),
+        ("struStartTime", NET_DVR_TIME),
+        ("struStopTime", NET_DVR_TIME),
+    ]
+
+
+class NET_DVR_FINDDATA_V30(ctypes.Structure):
+    _fields_ = [
+        ("sFileName", ctypes.c_char * 100),
+        ("struStartTime", NET_DVR_TIME),
+        ("struStopTime", NET_DVR_TIME),
+        ("dwFileSize", DWORD),
+        ("sCardNum", ctypes.c_char * 32),
+        ("byLocked", BYTE),
+        ("byFileType", BYTE),
+        ("byRes", BYTE * 2),
     ]
 
 
@@ -276,6 +402,266 @@ class PlayCtrl:
             return None
 
 
+@dataclass(frozen=True)
+class NativeArchiveItem:
+    filename: str
+    start_time: datetime | None
+    end_time: datetime | None
+    file_size: int
+
+
+def _decode_zero_terminated(raw_value: bytes | ctypes.Array[Any]) -> str:
+    raw = bytes(raw_value)
+    return raw.split(b"\x00", 1)[0].decode("utf-8", errors="ignore").strip()
+
+
+def _datetime_to_sdk_time(value: datetime) -> NET_DVR_TIME:
+    sdk_time = NET_DVR_TIME()
+    sdk_time.dwYear = int(value.year)
+    sdk_time.dwMonth = int(value.month)
+    sdk_time.dwDay = int(value.day)
+    sdk_time.dwHour = int(value.hour)
+    sdk_time.dwMinute = int(value.minute)
+    sdk_time.dwSecond = int(value.second)
+    return sdk_time
+
+
+def _sdk_time_to_datetime(value: NET_DVR_TIME) -> datetime | None:
+    try:
+        return datetime(
+            int(value.dwYear),
+            int(value.dwMonth),
+            int(value.dwDay),
+            int(value.dwHour),
+            int(value.dwMinute),
+            int(value.dwSecond),
+        )
+    except Exception:
+        return None
+
+
+class NativeDeviceSession:
+    def __init__(self, sdk_wrapper: "NativeHCNetSDK", user_id: int, device_info: NET_DVR_DEVICEINFO_V40) -> None:
+        self._sdk = sdk_wrapper
+        self.user_id = int(user_id)
+        self._device_info = device_info
+        self._callbacks: list[Any] = []
+        info_v30 = device_info.struDeviceV30
+        self.start_channel = int(info_v30.byStartChan or 1)
+        self.channel_count = int(info_v30.byChanNum)
+        self.ip_channel_count = int(info_v30.byIPChanNum) + int(info_v30.byHighDChanNum) * 256
+        self.serial_number = _decode_zero_terminated(info_v30.sSerialNumber)
+        self.serial = self.serial_number
+        self.model = ""
+        self.device_model = ""
+
+    def logout(self) -> None:
+        self._sdk.logout(self.user_id)
+
+    def find_files(
+        self,
+        *,
+        channel: int,
+        start_time: datetime,
+        end_time: datetime,
+        file_type: int,
+        stream_type: int,
+    ) -> list[NativeArchiveItem]:
+        return self._sdk.find_files(
+            user_id=self.user_id,
+            channel=channel,
+            start_time=start_time,
+            end_time=end_time,
+            file_type=file_type,
+            stream_type=stream_type,
+        )
+
+
+class NativeHCNetSDK:
+    def __init__(self, lib_dir: Path | None = None) -> None:
+        base = Path(lib_dir or DEFAULT_LIB_DIR)
+        lib_path = base / "libhcnetsdk.so"
+        mode = getattr(ctypes, "RTLD_GLOBAL", 0) | getattr(ctypes, "RTLD_LAZY", 0)
+        self._sdk = ctypes.CDLL(str(lib_path), mode=mode)
+        self._configure_prototypes()
+
+    def _configure_prototypes(self) -> None:
+        self._sdk.NET_DVR_Init.argtypes = []
+        self._sdk.NET_DVR_Init.restype = ctypes.c_bool
+        self._sdk.NET_DVR_Cleanup.argtypes = []
+        self._sdk.NET_DVR_Cleanup.restype = ctypes.c_bool
+        self._sdk.NET_DVR_GetLastError.argtypes = []
+        self._sdk.NET_DVR_GetLastError.restype = DWORD
+
+        if hasattr(self._sdk, "NET_DVR_SetConnectTime"):
+            self._sdk.NET_DVR_SetConnectTime.argtypes = [DWORD, DWORD]
+            self._sdk.NET_DVR_SetConnectTime.restype = ctypes.c_bool
+        if hasattr(self._sdk, "NET_DVR_SetReconnect"):
+            self._sdk.NET_DVR_SetReconnect.argtypes = [DWORD, ctypes.c_bool]
+            self._sdk.NET_DVR_SetReconnect.restype = ctypes.c_bool
+
+        if hasattr(self._sdk, "NET_DVR_Login_V40"):
+            self._sdk.NET_DVR_Login_V40.argtypes = [
+                ctypes.POINTER(NET_DVR_USER_LOGIN_INFO),
+                ctypes.POINTER(NET_DVR_DEVICEINFO_V40),
+            ]
+            self._sdk.NET_DVR_Login_V40.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_Login_V30"):
+            self._sdk.NET_DVR_Login_V30.argtypes = [
+                ctypes.c_char_p,
+                WORD,
+                ctypes.c_char_p,
+                ctypes.c_char_p,
+                ctypes.POINTER(NET_DVR_DEVICEINFO_V30),
+            ]
+            self._sdk.NET_DVR_Login_V30.restype = LONG
+
+        self._sdk.NET_DVR_Logout.argtypes = [LONG]
+        self._sdk.NET_DVR_Logout.restype = ctypes.c_bool
+
+        if hasattr(self._sdk, "NET_DVR_FindFile_V30"):
+            self._sdk.NET_DVR_FindFile_V30.argtypes = [LONG, ctypes.POINTER(NET_DVR_FILECOND)]
+            self._sdk.NET_DVR_FindFile_V30.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_FindNextFile_V30"):
+            self._sdk.NET_DVR_FindNextFile_V30.argtypes = [LONG, ctypes.POINTER(NET_DVR_FINDDATA_V30)]
+            self._sdk.NET_DVR_FindNextFile_V30.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_FindClose_V30"):
+            self._sdk.NET_DVR_FindClose_V30.argtypes = [LONG]
+            self._sdk.NET_DVR_FindClose_V30.restype = ctypes.c_bool
+
+    def init(self) -> None:
+        ok = bool(self._sdk.NET_DVR_Init())
+        if not ok:
+            raise RuntimeError(f"NET_DVR_Init failed: error={self.get_last_error()}")
+        if hasattr(self._sdk, "NET_DVR_SetConnectTime"):
+            self._sdk.NET_DVR_SetConnectTime(DWORD(2000), DWORD(1))
+        if hasattr(self._sdk, "NET_DVR_SetReconnect"):
+            self._sdk.NET_DVR_SetReconnect(DWORD(10_000), True)
+
+    def cleanup(self) -> None:
+        try:
+            self._sdk.NET_DVR_Cleanup()
+        except Exception:
+            pass
+
+    def get_last_error(self) -> int:
+        try:
+            return int(self._sdk.NET_DVR_GetLastError())
+        except Exception:
+            return -1
+
+    def logout(self, user_id: int) -> None:
+        self._sdk.NET_DVR_Logout(LONG(int(user_id)))
+
+    def login(self, host: str, port: int, username: str, password: str) -> NativeDeviceSession:
+        host_bytes = str(host).encode("utf-8")
+        username_bytes = str(username).encode("utf-8")
+        password_bytes = str(password).encode("utf-8")
+
+        if hasattr(self._sdk, "NET_DVR_Login_V40"):
+            login_info = NET_DVR_USER_LOGIN_INFO()
+            ctypes.memset(ctypes.byref(login_info), 0, ctypes.sizeof(login_info))
+            login_info.sDeviceAddress = host_bytes[:128]
+            login_info.wPort = int(port)
+            login_info.sUserName = username_bytes[:63]
+            login_info.sPassword = password_bytes[:63]
+            login_info.bUseAsynLogin = 0
+            login_info.byLoginMode = 2
+            login_info.byHttps = 0
+
+            device_info_v40 = NET_DVR_DEVICEINFO_V40()
+            ctypes.memset(ctypes.byref(device_info_v40), 0, ctypes.sizeof(device_info_v40))
+            user_id = int(self._sdk.NET_DVR_Login_V40(ctypes.byref(login_info), ctypes.byref(device_info_v40)))
+            if user_id >= 0:
+                return NativeDeviceSession(self, user_id, device_info_v40)
+            v40_error = self.get_last_error()
+        else:
+            v40_error = -1
+
+        if hasattr(self._sdk, "NET_DVR_Login_V30"):
+            device_info_v30 = NET_DVR_DEVICEINFO_V30()
+            ctypes.memset(ctypes.byref(device_info_v30), 0, ctypes.sizeof(device_info_v30))
+            user_id = int(
+                self._sdk.NET_DVR_Login_V30(
+                    host_bytes,
+                    WORD(int(port)),
+                    username_bytes,
+                    password_bytes,
+                    ctypes.byref(device_info_v30),
+                )
+            )
+            if user_id >= 0:
+                device_info_v40 = NET_DVR_DEVICEINFO_V40()
+                ctypes.memset(ctypes.byref(device_info_v40), 0, ctypes.sizeof(device_info_v40))
+                device_info_v40.struDeviceV30 = device_info_v30
+                return NativeDeviceSession(self, user_id, device_info_v40)
+
+        error_code = self.get_last_error()
+        if error_code < 0:
+            error_code = v40_error
+        raise SDKLoginError(error_code, f"HCNetSDK login failed: error={error_code}")
+
+    def find_files(
+        self,
+        *,
+        user_id: int,
+        channel: int,
+        start_time: datetime,
+        end_time: datetime,
+        file_type: int,
+        stream_type: int,
+    ) -> list[NativeArchiveItem]:
+        del stream_type
+        if not hasattr(self._sdk, "NET_DVR_FindFile_V30"):
+            raise RuntimeError("NET_DVR_FindFile_V30 unavailable")
+
+        cond = NET_DVR_FILECOND()
+        ctypes.memset(ctypes.byref(cond), 0, ctypes.sizeof(cond))
+        cond.lChannel = int(channel)
+        cond.dwFileType = int(file_type)
+        cond.struStartTime = _datetime_to_sdk_time(start_time)
+        cond.struStopTime = _datetime_to_sdk_time(end_time)
+
+        find_handle = int(self._sdk.NET_DVR_FindFile_V30(LONG(int(user_id)), ctypes.byref(cond)))
+        if find_handle < 0 or find_handle == 0xFFFFFFFF:
+            raise RuntimeError(f"NET_DVR_FindFile_V30 failed: error={self.get_last_error()}")
+
+        items: list[NativeArchiveItem] = []
+        searching_count = 0
+        try:
+            while True:
+                find_data = NET_DVR_FINDDATA_V30()
+                ret = int(self._sdk.NET_DVR_FindNextFile_V30(LONG(find_handle), ctypes.byref(find_data)))
+                if ret == 200:
+                    searching_count = 0
+                    items.append(
+                        NativeArchiveItem(
+                            filename=_decode_zero_terminated(find_data.sFileName),
+                            start_time=_sdk_time_to_datetime(find_data.struStartTime),
+                            end_time=_sdk_time_to_datetime(find_data.struStopTime),
+                            file_size=int(find_data.dwFileSize),
+                        )
+                    )
+                    continue
+                if ret == 201:
+                    searching_count += 1
+                    if searching_count > 50:
+                        break
+                    time.sleep(0.05)
+                    continue
+                if ret == 202:
+                    break
+                if ret == 0:
+                    break
+                raise RuntimeError(
+                    f"NET_DVR_FindNextFile_V30 failed: ret={ret} error={self.get_last_error()}"
+                )
+        finally:
+            if hasattr(self._sdk, "NET_DVR_FindClose_V30"):
+                self._sdk.NET_DVR_FindClose_V30(LONG(find_handle))
+        return items
+
+
 class HikvisionDeviceService:
     def __init__(self) -> None:
         self._connected = False
@@ -332,9 +718,7 @@ class HikvisionDeviceService:
         self.logout()
         self._params = params
         try:
-            import hikvision_sdk
-
-            sdk = hikvision_sdk.HCNetSDK()
+            sdk = NativeHCNetSDK(DEFAULT_LIB_DIR)
             sdk.init()
             device = sdk.login(params.host, params.port, params.username, params.password)
             self._sdk = sdk
@@ -831,8 +1215,6 @@ class HikvisionDeviceService:
             return -1
 
         try:
-            from hikvision_sdk.types import BYTE, DWORD, HWND, NET_DVR_STREAM_INFO, REALDATACALLBACK
-
             class NET_DVR_VOD_PARA(ctypes.Structure):
                 _fields_ = [
                     ("dwSize", DWORD),
@@ -940,8 +1322,6 @@ class HikvisionDeviceService:
             return -1
 
         try:
-            from hikvision_sdk.types import BYTE, DWORD, HWND, NET_DVR_STREAM_INFO
-
             class NET_DVR_VOD_PARA(ctypes.Structure):
                 _fields_ = [
                     ("dwSize", DWORD),
@@ -1650,17 +2030,13 @@ class HikvisionPlugin:
         if not host:
             return STATUS_OFFLINE, None, "Connection failed; IPC address is empty"
 
-        import hikvision_sdk  # type: ignore
-
-        sdk = hikvision_sdk.HCNetSDK()
+        sdk = NativeHCNetSDK(DEFAULT_LIB_DIR)
         device = None
         try:
             sdk.init()
-            if hasattr(sdk, "_sdk") and hasattr(sdk._sdk, "NET_DVR_SetConnectTime"):
-                sdk._sdk.NET_DVR_SetConnectTime(1000, 1)
             device = sdk.login(host, port, username, password)
             return STATUS_ONLINE, None, ""
-        except LoginError as exc:
+        except SDKLoginError as exc:
             error_code = exc.error_code
             if error_code == 1:
                 return STATUS_ACCOUNT_ERROR, error_code, "Wrong username/password"
@@ -1672,7 +2048,7 @@ class HikvisionPlugin:
         finally:
             try:
                 if device is not None:
-                    sdk.logout(device.user_id)
+                    device.logout()
             except Exception:
                 pass
             try:
