@@ -314,9 +314,6 @@ class MainWindow(Gtk.Window):
         self.live_focus_drag_start_y = 0.0
         self.live_focus_zoom_start_x = 0.0
         self.live_focus_zoom_start_y = 0.0
-        self.live_focus_snapshot_request_pending = False
-        self.live_focus_snapshot_refresh_source_id = 0
-        self.live_focus_snapshot_generation = 0
         self._syncing_live_channel_checks = False
         self._suppress_live_view_selection = False
         self.live_snapshot_generation = 0
@@ -656,12 +653,6 @@ class MainWindow(Gtk.Window):
         )
         overlay.add(self.live_video_host)
 
-        self.live_focus_snapshot_view = SnapshotView()
-        self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
-        self.live_focus_snapshot_view.hide()
-        overlay.add_overlay(self.live_focus_snapshot_view)
-        overlay.set_overlay_pass_through(self.live_focus_snapshot_view, True)
-
         header_box = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
         header_box.set_halign(Gtk.Align.FILL)
         header_box.set_valign(Gtk.Align.START)
@@ -966,15 +957,6 @@ class MainWindow(Gtk.Window):
         return None
 
     @staticmethod
-    def _is_default_zoom(zoom_state: ZoomState) -> bool:
-        return (
-            abs(zoom_state.x) < 1e-6
-            and abs(zoom_state.y) < 1e-6
-            and abs(zoom_state.width - 1.0) < 1e-6
-            and abs(zoom_state.height - 1.0) < 1e-6
-        )
-
-    @staticmethod
     def _clamp_zoom_state(zoom_state: ZoomState) -> ZoomState:
         width = max(0.1, min(float(zoom_state.width), 1.0))
         height = max(0.1, min(float(zoom_state.height), 1.0))
@@ -983,82 +965,14 @@ class MainWindow(Gtk.Window):
         return ZoomState(x, y, width, height)
 
     def _reset_live_focus_zoom(self) -> None:
+        if self.live_handle >= 0 and self.core.get_capabilities().supports_native_zoom:
+            self.core.reset_zoom(
+                session_id=self.live_handle,
+                on_done=lambda _result=None: None,
+                on_error=lambda _message: False,
+            )
         self.live_focus_zoom = ZoomState(0.0, 0.0, 1.0, 1.0)
         self.live_focus_dragging = False
-        self.live_focus_snapshot_request_pending = False
-        self.live_focus_snapshot_generation += 1
-        if self.live_focus_snapshot_refresh_source_id != 0:
-            GLib.source_remove(self.live_focus_snapshot_refresh_source_id)
-            self.live_focus_snapshot_refresh_source_id = 0
-        if hasattr(self, "live_focus_snapshot_view"):
-            self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
-            self.live_focus_snapshot_view.set_snapshot(None)
-            self.live_focus_snapshot_view.hide()
-
-    def _apply_live_focus_zoom_overlay(self) -> None:
-        if not hasattr(self, "live_focus_snapshot_view"):
-            return
-        self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
-        if self._is_default_zoom(self.live_focus_zoom):
-            self.live_focus_snapshot_view.set_snapshot(None)
-            self.live_focus_snapshot_view.hide()
-            if self.live_focus_snapshot_refresh_source_id != 0:
-                GLib.source_remove(self.live_focus_snapshot_refresh_source_id)
-                self.live_focus_snapshot_refresh_source_id = 0
-            self.live_focus_snapshot_request_pending = False
-            self.live_focus_snapshot_generation += 1
-            return
-        self.live_focus_snapshot_view.show()
-        if self.live_focus_snapshot_refresh_source_id == 0:
-            self.live_focus_snapshot_refresh_source_id = GLib.timeout_add(
-                400,
-                self._refresh_live_focus_snapshot_tick,
-            )
-        self._request_live_focus_snapshot()
-
-    def _refresh_live_focus_snapshot_tick(self) -> bool:
-        if self.live_handle < 0 or self.active_live_channel is None or self._is_default_zoom(self.live_focus_zoom):
-            self.live_focus_snapshot_refresh_source_id = 0
-            return False
-        self._request_live_focus_snapshot()
-        return True
-
-    def _request_live_focus_snapshot(self) -> None:
-        channel = self.active_live_channel
-        if channel is None or self.live_handle < 0 or self.live_focus_snapshot_request_pending:
-            return
-        if not self.core.get_capabilities().supports_snapshot:
-            return
-        self.live_focus_snapshot_request_pending = True
-        generation = self.live_focus_snapshot_generation
-        self.core.request_live_snapshot(
-            channel=channel,
-            on_done=lambda result, gen=generation: self._handle_live_focus_snapshot_done(gen, result),
-            on_error=lambda message, channel_id=channel, gen=generation: self._handle_live_focus_snapshot_error(gen, channel_id, message),
-        )
-
-    def _handle_live_focus_snapshot_done(self, generation: int, result: SnapshotResult) -> bool:
-        if generation != self.live_focus_snapshot_generation:
-            return False
-        self.live_focus_snapshot_request_pending = False
-        if self.live_handle < 0 or self.active_live_channel != result.channel or self._is_default_zoom(self.live_focus_zoom):
-            return False
-        try:
-            pixbuf = self._decode_snapshot_pixbuf(result.image_bytes)
-        except Exception as exc:
-            return self._handle_live_focus_snapshot_error(generation, result.channel, str(exc))
-        self.live_focus_snapshot_view.set_zoom_state(self.live_focus_zoom)
-        self.live_focus_snapshot_view.set_snapshot(pixbuf)
-        self.live_focus_snapshot_view.show()
-        return False
-
-    def _handle_live_focus_snapshot_error(self, generation: int, channel: int, message: str) -> bool:
-        if generation != self.live_focus_snapshot_generation:
-            return False
-        self.live_focus_snapshot_request_pending = False
-        if self.active_live_channel == channel and not self._is_default_zoom(self.live_focus_zoom):
-            self._set_live_status(f"Live focus zoom snapshot error: {message}")
-        return False
 
     @staticmethod
     def _decode_snapshot_pixbuf(image_bytes: bytes) -> GdkPixbuf.Pixbuf:
@@ -1535,7 +1449,7 @@ class MainWindow(Gtk.Window):
             self._request_stop_live_preview(status_text="Returning focused channel to grid...")
 
     def _on_live_focus_drag_start(self, x: float, y: float) -> None:
-        if self.live_handle < 0 or self._is_default_zoom(self.live_focus_zoom):
+        if self.live_handle < 0 or self.live_focus_zoom.width >= 0.999:
             return
         self.live_focus_dragging = True
         self.live_focus_drag_start_x = x
@@ -1562,7 +1476,12 @@ class MainWindow(Gtk.Window):
             )
         )
         self.live_focus_zoom = new_zoom
-        self._apply_live_focus_zoom_overlay()
+        self.core.set_zoom(
+            session_id=self.live_handle,
+            zoom_state=new_zoom,
+            on_done=lambda _result=None: None,
+            on_error=self._handle_error,
+        )
 
     def _on_live_focus_drag_end(self, _x: float, _y: float) -> None:
         self.live_focus_dragging = False
@@ -1590,7 +1509,19 @@ class MainWindow(Gtk.Window):
             )
         )
         self.live_focus_zoom = new_zoom
-        self._apply_live_focus_zoom_overlay()
+        if new_zoom.width >= 0.999 and new_zoom.height >= 0.999:
+            self.core.reset_zoom(
+                session_id=self.live_handle,
+                on_done=lambda _result=None: None,
+                on_error=self._handle_error,
+            )
+            return
+        self.core.set_zoom(
+            session_id=self.live_handle,
+            zoom_state=new_zoom,
+            on_done=lambda _result=None: None,
+            on_error=self._handle_error,
+        )
 
     def _on_focus_grid_cell(self, cell_index: int) -> None:
         if cell_index < 0 or cell_index >= len(self.live_grid_cells):
@@ -2758,9 +2689,6 @@ class MainWindow(Gtk.Window):
         if self.live_focus_resize_source_id != 0:
             GLib.source_remove(self.live_focus_resize_source_id)
             self.live_focus_resize_source_id = 0
-        if self.live_focus_snapshot_refresh_source_id != 0:
-            GLib.source_remove(self.live_focus_snapshot_refresh_source_id)
-            self.live_focus_snapshot_refresh_source_id = 0
         for cell in self.live_grid_cells:
             if cell.resize_source_id != 0:
                 GLib.source_remove(cell.resize_source_id)

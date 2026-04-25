@@ -278,6 +278,7 @@ class LiveSessionState:
     width: int
     height: int
     profile: StreamProfile
+    play_port: int | None = None
 
 
 @dataclass
@@ -317,6 +318,27 @@ class HikvisionPlugin:
         if port is not None:
             session.play_port = int(port)
         return session.play_port
+
+    def _resolve_live_play_port(self, session_id: int, session: LiveSessionState) -> int | None:
+        if not self._ensure_playctrl_loaded() or self._playctrl is None:
+            return None
+        if session.play_port is not None and session.play_port >= 0:
+            size = self._playctrl.get_picture_size(int(session.play_port))
+            st = self._playctrl.get_system_time(int(session.play_port))
+            if size is not None or st is not None:
+                return int(session.play_port)
+
+        hcnetsdk = self._resolve_sdk_library()
+        if not hasattr(hcnetsdk, "NET_DVR_GetRealPlayerIndex"):
+            return None
+        hcnetsdk.NET_DVR_GetRealPlayerIndex.argtypes = [ctypes.c_int]
+        hcnetsdk.NET_DVR_GetRealPlayerIndex.restype = ctypes.c_int
+        with self.service._sdk_lock:
+            play_port = int(hcnetsdk.NET_DVR_GetRealPlayerIndex(int(session_id)))
+        if play_port < 0:
+            return None
+        session.play_port = play_port
+        return play_port
 
     def _start_playback_keepalive(self, handle: int) -> None:
         if handle in self._keepalive_threads:
@@ -1110,6 +1132,7 @@ class HikvisionPlugin:
             width=host_binding.width,
             height=host_binding.height,
             profile=profile,
+            play_port=None,
         )
         logger.info("Live preview started handle=%s channel=%s profile=%s", handle, channel, profile.id)
         return int(handle)
@@ -1242,11 +1265,18 @@ class HikvisionPlugin:
         if session_id < 0:
             return
         self.ensure_connected()
-        session = self._playback_sessions.get(session_id)
-        if session is None:
-            return
-        port = self._probe_play_port(session)
-        if port is None or self._playctrl is None:
+        window_id = 0
+        live_session = self._live_sessions.get(int(session_id))
+        if live_session is not None:
+            port = self._resolve_live_play_port(int(session_id), live_session)
+            window_id = int(live_session.window_id)
+        else:
+            session = self._playback_sessions.get(session_id)
+            if session is None:
+                return
+            port = self._probe_play_port(session)
+            window_id = int(session.window_id)
+        if port is None or self._playctrl is None or window_id <= 0:
             return
         picture_size = self._playctrl.get_picture_size(port)
         if picture_size is None:
@@ -1261,7 +1291,7 @@ class HikvisionPlugin:
         right = max(left + 1, min(right, fw))
         bottom = max(top + 1, min(bottom, fh))
         rect = RECT(left, top, right, bottom)
-        success = self._playctrl.set_display_region(port, rect=rect, hwnd=session.window_id, enable=True)
+        success = self._playctrl.set_display_region(port, rect=rect, hwnd=window_id, enable=True)
         if success:
             self._playctrl.refresh_play(port)
 
@@ -1269,13 +1299,20 @@ class HikvisionPlugin:
         if session_id < 0:
             return
         self.ensure_connected()
-        session = self._playback_sessions.get(session_id)
-        if session is None:
+        window_id = 0
+        live_session = self._live_sessions.get(int(session_id))
+        if live_session is not None:
+            port = self._resolve_live_play_port(int(session_id), live_session)
+            window_id = int(live_session.window_id)
+        else:
+            session = self._playback_sessions.get(session_id)
+            if session is None:
+                return
+            port = self._probe_play_port(session)
+            window_id = int(session.window_id)
+        if port is None or self._playctrl is None or window_id <= 0:
             return
-        port = self._probe_play_port(session)
-        if port is None or self._playctrl is None:
-            return
-        success = self._playctrl.set_display_region(port, rect=None, hwnd=session.window_id, enable=False)
+        success = self._playctrl.set_display_region(port, rect=None, hwnd=window_id, enable=False)
         if success:
             self._playctrl.refresh_play(port)
 
