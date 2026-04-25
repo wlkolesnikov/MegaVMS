@@ -7,12 +7,35 @@ from pathlib import Path
 import sys
 
 
-REPO_ROOT = Path(__file__).resolve().parent.parent
-QT_ROOT = REPO_ROOT / "sdk-hik-QT"
-if str(QT_ROOT) not in sys.path:
-    sys.path.insert(0, str(QT_ROOT))
+DEFAULT_LIB_DIR = Path(os.environ.get("HIKVISION_LIB_DIR", Path.home() / ".local/lib/hikvision"))
 
-from hikvision_player.config import restart_if_needed  # type: ignore  # noqa: E402
+
+def ensure_runtime_environment(lib_dir: Path | None = None) -> bool:
+    base = Path(lib_dir or DEFAULT_LIB_DIR)
+    changed = False
+
+    desired_ld_paths = [str(base), str(base / "HCNetSDKCom")]
+    current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    current_parts = [part for part in current_ld.split(":") if part]
+    for path in reversed(desired_ld_paths):
+        if path not in current_parts:
+            current_parts.insert(0, path)
+            changed = True
+
+    new_ld = ":".join(current_parts)
+    if new_ld != current_ld:
+        os.environ["LD_LIBRARY_PATH"] = new_ld
+
+    if os.environ.get("QT_QPA_PLATFORM") != "xcb":
+        os.environ["QT_QPA_PLATFORM"] = "xcb"
+        changed = True
+
+    return changed
+
+
+def restart_if_needed(lib_dir: Path | None = None) -> None:
+    if ensure_runtime_environment(lib_dir=lib_dir):
+        os.execv(sys.executable, [sys.executable] + sys.argv)
 
 
 def main() -> int:
