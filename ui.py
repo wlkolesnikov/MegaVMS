@@ -20,6 +20,9 @@ except ImportError:  # pragma: no cover
     GdkX11 = None
 
 from contracts import (
+    ArchiveDownloadProgress,
+    ArchiveDownloadRequest,
+    ArchiveDownloadResult,
     ArchiveCoverageReport,
     ArchiveFile,
     ChannelInfo,
@@ -300,6 +303,16 @@ class LiveGridCellState:
     snapshot_error: str = ""
 
 
+@dataclass
+class ArchiveDownloadQueueTask:
+    id: int
+    request: ArchiveDownloadRequest
+    status: str = "queued"
+    progress_percent: int = 0
+    result: ArchiveDownloadResult | None = None
+    error_message: str = ""
+
+
 class MainWindow(Gtk.Window):
     DIAGNOSTIC_INTERVAL_SECONDS = 600
     LIVE_LAYOUT_SPECS = {
@@ -395,6 +408,11 @@ class MainWindow(Gtk.Window):
         self.archive_calendar_request_id = 0
         self.archive_calendar_year_month: tuple[int, int] | None = None
         self.archive_calendar_channel: int | None = None
+        self.archive_calendar_marked_days: set[int] = set()
+        self.archive_download_request_id = 0
+        self.archive_download_active_task_id: int | None = None
+        self.archive_download_active = False
+        self.archive_download_tasks: list[ArchiveDownloadQueueTask] = []
 
         self.set_default_size(1380, 920)
         self.connect("destroy", self._on_destroy)
@@ -419,6 +437,7 @@ class MainWindow(Gtk.Window):
         self._prefill_from_runtime_config()
         self._schedule_diagnostics()
         self.show_all()
+        self._refresh_archive_download_queue_ui()
 
     @staticmethod
     def _force_transparent(widget: Gtk.Widget) -> None:
@@ -1255,6 +1274,16 @@ class MainWindow(Gtk.Window):
         self._sync_live_view_form()
         self._refresh_live_grid_assignments()
 
+    def _refresh_archive_controls(self) -> None:
+        supports_download = self.core.get_capabilities().supports_archive_download
+        if hasattr(self, "load_archive_button"):
+            self.load_archive_button.set_sensitive(True)
+        if hasattr(self, "download_archive_button"):
+            self.download_archive_button.set_sensitive(supports_download)
+            self.download_archive_button.set_label(
+                "Add Download to Queue" if self.archive_download_active else "Queue Download"
+            )
+
     def _on_toggle_live_sidebar(self, button: Gtk.ToggleButton) -> None:
         if button.get_active():
             self.live_sidebar_popover.show_all()
@@ -1716,8 +1745,7 @@ class MainWindow(Gtk.Window):
         self.channel_combo = Gtk.ComboBoxText()
         self.channel_combo.connect("changed", self._on_archive_channel_changed)
         self.calendar = Gtk.Calendar()
-        self.calendar.connect("notify::month", self._on_archive_calendar_month_changed)
-        self.calendar.connect("notify::year", self._on_archive_calendar_month_changed)
+        self.calendar.connect("month-changed", self._on_archive_calendar_month_changed)
         self.calendar.connect("day-selected", self._on_archive_calendar_day_selected)
 
         controls.attach(Gtk.Label(label="Channel", xalign=0.0), 0, 0, 1, 1)
@@ -1731,6 +1759,56 @@ class MainWindow(Gtk.Window):
         self.load_archive_button = Gtk.Button(label="Load Archive Day")
         self.load_archive_button.connect("clicked", self._on_load_archive_day)
         actions.pack_start(self.load_archive_button, False, False, 0)
+
+        download_frame = Gtk.Frame(label="Download by Time")
+        download_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        download_box.set_border_width(8)
+        download_frame.add(download_box)
+
+        download_grid = Gtk.Grid(column_spacing=8, row_spacing=8)
+        download_box.pack_start(download_grid, False, False, 0)
+
+        self.download_start_entry = Gtk.Entry()
+        self.download_start_entry.set_placeholder_text("2026-04-26 10:00:00")
+        self.download_end_entry = Gtk.Entry()
+        self.download_end_entry.set_placeholder_text("2026-04-26 10:30:00")
+
+        download_grid.attach(Gtk.Label(label="Start", xalign=0.0), 0, 0, 1, 1)
+        download_grid.attach(self.download_start_entry, 1, 0, 1, 1)
+        download_grid.attach(Gtk.Label(label="End", xalign=0.0), 0, 1, 1, 1)
+        download_grid.attach(self.download_end_entry, 1, 1, 1, 1)
+
+        self.download_archive_button = Gtk.Button(label="Queue Download")
+        self.download_archive_button.connect("clicked", self._on_download_archive_range)
+        download_box.pack_start(self.download_archive_button, False, False, 0)
+
+        self.download_progress_label = Gtk.Label(
+            label="Select an archive file or enter a time range to download.",
+            xalign=0.0,
+        )
+        self.download_progress_label.set_line_wrap(True)
+        download_box.pack_start(self.download_progress_label, False, False, 0)
+        left_box.pack_start(download_frame, False, False, 0)
+
+        queue_frame = Gtk.Frame(label="Download Queue")
+        queue_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        queue_box.set_border_width(8)
+        queue_frame.add(queue_box)
+
+        self.archive_download_store = Gtk.ListStore(str, str, str, str, str)
+        self.archive_download_tree = Gtk.TreeView(model=self.archive_download_store)
+        for index, title in enumerate(("State", "Channel", "Range", "Target", "Progress")):
+            renderer = Gtk.CellRendererText()
+            column = Gtk.TreeViewColumn(title, renderer, text=index)
+            column.set_resizable(True)
+            self.archive_download_tree.append_column(column)
+
+        queue_scroll = Gtk.ScrolledWindow()
+        queue_scroll.set_policy(Gtk.PolicyType.AUTOMATIC, Gtk.PolicyType.AUTOMATIC)
+        queue_scroll.set_size_request(-1, 140)
+        queue_scroll.add(self.archive_download_tree)
+        queue_box.pack_start(queue_scroll, True, True, 0)
+        left_box.pack_start(queue_frame, False, False, 0)
 
         self.file_store = Gtk.ListStore(str, str, str, int)
         self.file_tree = Gtk.TreeView(model=self.file_store)
@@ -1971,8 +2049,8 @@ class MainWindow(Gtk.Window):
     def _on_periodic_diagnostic(self) -> bool:
         if self.current_runtime_config is None:
             return True
-        if self.playback_handle >= 0 or self._has_active_live():
-            self._set_status("Periodic diagnostic skipped while live/archive session is active.")
+        if self.playback_handle >= 0 or self._has_active_live() or self.archive_download_active:
+            self._set_status("Periodic diagnostic skipped while live/archive/download session is active.")
             return True
         self._set_status("Running periodic diagnostic...")
         self.core.run_saved_diagnostic(
@@ -2038,6 +2116,7 @@ class MainWindow(Gtk.Window):
         self.current_channels = channels
         self._populate_channel_combo(self.channel_combo)
         self._populate_channel_combo(self.report_channel_combo)
+        self._refresh_archive_controls()
         self._refresh_live_sidebar_store()
         if channels:
             self._syncing_channel_selection = True
@@ -2078,6 +2157,8 @@ class MainWindow(Gtk.Window):
         if channel is None:
             self.calendar.clear_marks()
             self.archive_calendar_year_month = None
+            self.archive_calendar_channel = None
+            self.archive_calendar_marked_days = set()
             return
 
         year, month_zero, _ = self.calendar.get_date()
@@ -2087,11 +2168,10 @@ class MainWindow(Gtk.Window):
         if self.archive_calendar_year_month == month_key and self.archive_calendar_channel == channel:
             return
 
-        self.archive_calendar_year_month = month_key
-        self.archive_calendar_channel = channel
         self.archive_calendar_request_id += 1
         request_id = self.archive_calendar_request_id
         self.calendar.clear_marks()
+        self.archive_calendar_marked_days = set()
         self._set_status(f"Loading archive availability for channel {channel} {year}-{month:02d}...")
 
         self.core.list_archive_days(
@@ -2117,26 +2197,39 @@ class MainWindow(Gtk.Window):
         current_channel = self._try_selected_channel()
         if current_channel != channel:
             return False
+        current_year, current_month_zero, _ = self.calendar.get_date()
+        current_month_key = (int(current_year), int(current_month_zero) + 1)
+        if current_month_key != (year, month):
+            return False
+        self.archive_calendar_year_month = (year, month)
+        self.archive_calendar_channel = channel
         self.calendar.clear_marks()
+        self.archive_calendar_marked_days = set()
         for day in sorted(days):
             if 1 <= day <= 31:
                 self.calendar.mark_day(day)
+                self.archive_calendar_marked_days.add(day)
+        self.calendar.queue_draw()
         self._set_status(
-            f"Archive availability loaded for channel {channel} {year}-{month:02d}: {len(days)} days"
+            f"Archive availability loaded for channel {channel} {year}-{month:02d}: {len(days)} days, marked={sorted(self.archive_calendar_marked_days)}"
         )
         return False
 
     def _handle_archive_days_error(self, message: str, request_id: int) -> bool:
         if request_id != self.archive_calendar_request_id:
             return False
+        self.archive_calendar_year_month = None
+        self.archive_calendar_channel = None
         self.calendar.clear_marks()
+        self.archive_calendar_marked_days = set()
+        self.calendar.queue_draw()
         self._set_status(f"Archive availability request failed: {message}")
         return False
 
     def _on_archive_calendar_day_selected(self, calendar: Gtk.Calendar) -> None:
-        self._refresh_archive_calendar_days()
+        return
 
-    def _on_archive_calendar_month_changed(self, calendar: Gtk.Calendar, param: object) -> None:
+    def _on_archive_calendar_month_changed(self, calendar: Gtk.Calendar) -> None:
         self._refresh_archive_calendar_days()
 
     def _selected_file(self) -> ArchiveFile | None:
@@ -2186,6 +2279,187 @@ class MainWindow(Gtk.Window):
 
     def _set_playback_info(self, text: str) -> None:
         self.playback_info_label.set_text(text)
+
+    def _set_download_info(self, text: str) -> None:
+        self.download_progress_label.set_text(text)
+
+    @staticmethod
+    def _archive_download_task_state_text(status: str) -> str:
+        labels = {
+            "queued": "Queued",
+            "running": "Running",
+            "completed": "Completed",
+            "failed": "Failed",
+        }
+        return labels.get(status, status.capitalize())
+
+    @staticmethod
+    def _format_archive_download_range_text(request: ArchiveDownloadRequest) -> str:
+        return (
+            f"{request.start_time:%Y-%m-%d %H:%M:%S} .. "
+            f"{request.end_time:%Y-%m-%d %H:%M:%S}"
+        )
+
+    def _find_archive_download_task(self, request_id: int) -> ArchiveDownloadQueueTask | None:
+        for task in self.archive_download_tasks:
+            if task.id == request_id:
+                return task
+        return None
+
+    def _active_archive_download_task(self) -> ArchiveDownloadQueueTask | None:
+        request_id = self.archive_download_active_task_id
+        if request_id is None:
+            return None
+        return self._find_archive_download_task(request_id)
+
+    def _queued_archive_download_count(self) -> int:
+        return sum(1 for task in self.archive_download_tasks if task.status == "queued")
+
+    def _refresh_archive_download_store(self) -> None:
+        if not hasattr(self, "archive_download_store"):
+            return
+        self.archive_download_store.clear()
+        for task in self.archive_download_tasks:
+            if task.status == "completed" and task.result is not None:
+                progress_text = f"100% / {task.result.bytes_written} bytes"
+            elif task.status == "failed" and task.error_message:
+                progress_text = task.error_message
+            else:
+                progress_text = f"{task.progress_percent}%"
+            self.archive_download_store.append(
+                [
+                    self._archive_download_task_state_text(task.status),
+                    str(task.request.channel),
+                    self._format_archive_download_range_text(task.request),
+                    task.request.save_path,
+                    progress_text,
+                ]
+            )
+
+    def _refresh_archive_download_info(self) -> None:
+        active_task = self._active_archive_download_task()
+        queued_count = self._queued_archive_download_count()
+        if active_task is not None:
+            self._set_download_info(
+                f"Running: {active_task.progress_percent}% | channel={active_task.request.channel} | "
+                f"{self._format_archive_download_range_text(active_task.request)} | queued={queued_count}"
+            )
+            return
+        if queued_count > 0:
+            self._set_download_info(f"{queued_count} archive download task(s) queued.")
+            return
+        if self.archive_download_tasks:
+            last_task = self.archive_download_tasks[-1]
+            if last_task.status == "completed" and last_task.result is not None:
+                self._set_download_info(
+                    f"Last completed: {last_task.result.bytes_written} bytes -> {last_task.result.save_path}"
+                )
+                return
+            if last_task.status == "failed":
+                self._set_download_info(f"Last failed: {last_task.error_message}")
+                return
+        self._set_download_info("Select an archive file or enter a time range to download.")
+
+    def _refresh_archive_download_queue_ui(self) -> None:
+        self._refresh_archive_controls()
+        self._refresh_archive_download_store()
+        self._refresh_archive_download_info()
+
+    def _enqueue_archive_download(self, request: ArchiveDownloadRequest) -> None:
+        self.archive_download_request_id += 1
+        task = ArchiveDownloadQueueTask(
+            id=self.archive_download_request_id,
+            request=request,
+        )
+        self.archive_download_tasks.append(task)
+        self._refresh_archive_download_queue_ui()
+        if self.archive_download_active:
+            self._set_status(
+                f"Archive download queued: {request.save_path} "
+                f"(pending={self._queued_archive_download_count()})"
+            )
+            return
+        self._start_next_archive_download()
+
+    def _start_next_archive_download(self) -> None:
+        if self.archive_download_active:
+            return
+        next_task = next((task for task in self.archive_download_tasks if task.status == "queued"), None)
+        if next_task is None:
+            self.archive_download_active_task_id = None
+            self.archive_download_active = False
+            self._refresh_archive_download_queue_ui()
+            return
+
+        next_task.status = "running"
+        next_task.progress_percent = 0
+        next_task.result = None
+        next_task.error_message = ""
+        self.archive_download_active_task_id = next_task.id
+        self.archive_download_active = True
+        self._refresh_archive_download_queue_ui()
+        self._set_status(f"Starting archive download to {next_task.request.save_path}")
+        self.core.download_archive_by_time(
+            request=next_task.request,
+            on_done=lambda result, request_id=next_task.id: self._handle_archive_download_done(request_id, result),
+            on_error=lambda message, request_id=next_task.id: self._handle_archive_download_error(request_id, message),
+            on_progress=lambda progress, request_id=next_task.id: self._handle_archive_download_progress(request_id, progress),
+        )
+
+    @staticmethod
+    def _format_archive_datetime(value: datetime) -> str:
+        return value.strftime("%Y-%m-%d %H:%M:%S")
+
+    def _set_archive_download_range(self, start_time: datetime, end_time: datetime) -> None:
+        self.download_start_entry.set_text(self._format_archive_datetime(start_time))
+        self.download_end_entry.set_text(self._format_archive_datetime(end_time))
+
+    @staticmethod
+    def _parse_archive_datetime(value: str, field_name: str) -> datetime:
+        try:
+            return datetime.strptime(value.strip(), "%Y-%m-%d %H:%M:%S")
+        except ValueError as exc:
+            raise RuntimeError(
+                f"{field_name} must use format YYYY-MM-DD HH:MM:SS"
+            ) from exc
+
+    def _build_archive_download_request(self, save_path: str) -> ArchiveDownloadRequest:
+        channel = self._try_selected_channel()
+        if channel is None:
+            raise RuntimeError("Select a channel before archive download.")
+        start_time = self._parse_archive_datetime(self.download_start_entry.get_text(), "Download start")
+        end_time = self._parse_archive_datetime(self.download_end_entry.get_text(), "Download end")
+        return ArchiveDownloadRequest(
+            channel=channel,
+            start_time=start_time,
+            end_time=end_time,
+            save_path=save_path,
+        )
+
+    @staticmethod
+    def _suggest_archive_download_name(request: ArchiveDownloadRequest) -> str:
+        start_text = request.start_time.strftime("%Y%m%d_%H%M%S")
+        end_text = request.end_time.strftime("%Y%m%d_%H%M%S")
+        return f"ch{request.channel:02d}_{start_text}_{end_text}.mp4"
+
+    def _choose_archive_download_path(self, request: ArchiveDownloadRequest) -> str | None:
+        dialog = Gtk.FileChooserDialog(
+            title="Save Archive Download",
+            parent=self,
+            action=Gtk.FileChooserAction.SAVE,
+        )
+        dialog.add_buttons(
+            Gtk.STOCK_CANCEL,
+            Gtk.ResponseType.CANCEL,
+            Gtk.STOCK_SAVE,
+            Gtk.ResponseType.ACCEPT,
+        )
+        dialog.set_do_overwrite_confirmation(True)
+        dialog.set_current_name(self._suggest_archive_download_name(request))
+        response = dialog.run()
+        filename = dialog.get_filename() if response == Gtk.ResponseType.ACCEPT else None
+        dialog.destroy()
+        return filename
 
     def _current_playback_time(self) -> datetime | None:
         return self.playback_position_time
@@ -2737,12 +3011,96 @@ class MainWindow(Gtk.Window):
                     item.size_bytes,
                 ]
             )
+        if files:
+            self._set_archive_download_range(files[0].start_time, files[-1].end_time)
+        else:
+            day_start = day.replace(hour=0, minute=0, second=0, microsecond=0)
+            day_end = day.replace(hour=23, minute=59, second=59, microsecond=0)
+            self._set_archive_download_range(day_start, day_end)
         self._set_playback_info("Выберите файл архива или кликните по сегменту на timeline.")
+        if not self.archive_download_tasks:
+            self._set_download_info("Adjust the range if needed and add archive download to queue.")
         self._set_status(f"Loaded {len(files)} archive files for {day.date()}")
         return False
 
     def _handle_archive_segments(self, day: datetime, segments) -> bool:
         self.timeline.set_day_segments(day_start=day, segments=list(segments))
+        return False
+
+    def _request_download_archive_by_time(self) -> None:
+        capabilities = self.core.get_capabilities()
+        if not capabilities.supports_archive_download:
+            self._set_status("Current backend does not support archive download in this mode.")
+            return
+
+        try:
+            draft_request = self._build_archive_download_request(save_path="")
+        except Exception as exc:
+            self._set_status(str(exc))
+            return
+
+        save_path = self._choose_archive_download_path(draft_request)
+        if not save_path:
+            self._set_status("Archive download cancelled.")
+            return
+
+        try:
+            request = self._build_archive_download_request(save_path=save_path)
+        except Exception as exc:
+            self._set_status(str(exc))
+            return
+
+        self._enqueue_archive_download(request)
+
+    def _handle_archive_download_progress(
+        self,
+        request_id: int,
+        progress: ArchiveDownloadProgress,
+    ) -> bool:
+        task = self._find_archive_download_task(request_id)
+        if task is None or self.archive_download_active_task_id != request_id:
+            return False
+        task.progress_percent = progress.progress_percent
+        if progress.state == "completed":
+            task.progress_percent = 100
+        self._refresh_archive_download_queue_ui()
+        self._set_status(
+            f"Archive download {progress.progress_percent}% -> {progress.request.save_path}"
+        )
+        return False
+
+    def _handle_archive_download_done(
+        self,
+        request_id: int,
+        result: ArchiveDownloadResult,
+    ) -> bool:
+        task = self._find_archive_download_task(request_id)
+        if task is None:
+            return False
+        task.status = "completed"
+        task.progress_percent = 100
+        task.result = result
+        task.error_message = ""
+        if self.archive_download_active_task_id == request_id:
+            self.archive_download_active_task_id = None
+        self.archive_download_active = False
+        self._refresh_archive_download_queue_ui()
+        self._set_status(f"Archive download completed: {result.save_path}")
+        self._start_next_archive_download()
+        return False
+
+    def _handle_archive_download_error(self, request_id: int, message: str) -> bool:
+        task = self._find_archive_download_task(request_id)
+        if task is None:
+            return False
+        task.status = "failed"
+        task.error_message = message
+        if self.archive_download_active_task_id == request_id:
+            self.archive_download_active_task_id = None
+        self.archive_download_active = False
+        self._refresh_archive_download_queue_ui()
+        self._set_status(f"Archive download failed: {message}")
+        self._start_next_archive_download()
         return False
 
     def _on_file_selected(self, selection: Gtk.TreeSelection) -> None:
@@ -2756,6 +3114,7 @@ class MainWindow(Gtk.Window):
             return
         item = self.current_files[index]
         self.timeline.set_cursor_time(item.start_time)
+        self._set_archive_download_range(item.start_time, item.end_time)
         self._request_start_playback(item)
 
     def _on_timeline_seek(self, when: datetime) -> None:
@@ -2767,14 +3126,14 @@ class MainWindow(Gtk.Window):
 
         index, item = match
         self._select_file_index(index)
-        if self.playback_handle >= 0 and self.active_archive_file == item:
-            self._request_seek_playback(when)
-            return
         self._request_start_playback(item, resume_time=when)
 
     def _on_stop_playback(self, _button: Gtk.Button) -> None:
         self._request_stop_playback(status_text="Stopping archive playback...")
         self._set_playback_info("Воспроизведение остановлено.")
+
+    def _on_download_archive_range(self, _button: Gtk.Button) -> None:
+        self._request_download_archive_by_time()
 
     def _on_pause_playback(self, _button: Gtk.Button) -> None:
         self._request_pause_playback()

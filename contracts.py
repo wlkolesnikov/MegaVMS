@@ -40,6 +40,7 @@ class ZoomState:
 class PluginCapabilities:
     supports_live: bool = False
     supports_archive: bool = False
+    supports_archive_download: bool = False
     supports_native_surface_binding: bool = False
     supports_grid_low_res_profile: bool = False
     supports_profile_switch: bool = False
@@ -133,6 +134,31 @@ class ArchiveSegment:
     start_time: datetime
     end_time: datetime
     label: str = ""
+
+
+@dataclass(frozen=True)
+class ArchiveDownloadRequest:
+    channel: int
+    start_time: datetime
+    end_time: datetime
+    save_path: str
+    stream_type: int = 0
+    use_best_stream: bool = True
+
+
+@dataclass(frozen=True)
+class ArchiveDownloadProgress:
+    request: ArchiveDownloadRequest
+    progress_percent: int
+    state: str
+
+
+@dataclass(frozen=True)
+class ArchiveDownloadResult:
+    request: ArchiveDownloadRequest
+    save_path: str
+    bytes_written: int
+    completed_at: str
 
 
 @dataclass(frozen=True)

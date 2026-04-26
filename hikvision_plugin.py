@@ -15,6 +15,9 @@ from typing import Any
 import xml.etree.ElementTree as ET
 
 from contracts import (
+    ArchiveDownloadProgress,
+    ArchiveDownloadRequest,
+    ArchiveDownloadResult,
     ArchiveCoverageReport,
     ArchiveFile,
     ArchiveSegment,
@@ -69,11 +72,11 @@ SDK_ERROR_MESSAGES = {
     ),
 }
 
-LONG = ctypes.c_long
-DWORD = ctypes.c_uint32
-WORD = ctypes.c_uint16
+LONG = ctypes.c_int
+DWORD = ctypes.c_uint
+WORD = ctypes.c_ushort
 BYTE = ctypes.c_ubyte
-HWND = ctypes.c_void_p
+HWND = ctypes.c_uint
 BOOL = ctypes.c_int
 REALDATACALLBACK = ctypes.CFUNCTYPE(None, LONG, DWORD, ctypes.POINTER(BYTE), DWORD, ctypes.c_void_p)
 
@@ -185,6 +188,80 @@ class NET_DVR_TIME(ctypes.Structure):
     ]
 
 
+class NET_DVR_VOD_PARA(ctypes.Structure):
+    _fields_ = [
+        ("dwSize", DWORD),
+        ("struIDInfo", NET_DVR_STREAM_INFO),
+        ("struBeginTime", NET_DVR_TIME),
+        ("struEndTime", NET_DVR_TIME),
+        ("hWnd", HWND),
+        ("byDrawFrame", BYTE),
+        ("byVolumeType", BYTE),
+        ("byVolumeNum", BYTE),
+        ("byStreamType", BYTE),
+        ("dwFileIndex", DWORD),
+        ("byAudioFile", BYTE),
+        ("byCourseFile", BYTE),
+        ("byDownload", BYTE),
+        ("byOptimalStreamType", BYTE),
+        ("byUseAsyn", BYTE),
+        ("byRes2", BYTE * 19),
+    ]
+
+
+class NET_DVR_PLAYCOND(ctypes.Structure):
+    _fields_ = [
+        ("dwChannel", DWORD),
+        ("struStartTime", NET_DVR_TIME),
+        ("struStopTime", NET_DVR_TIME),
+        ("byDrawFrame", BYTE),
+        ("byStreamType", BYTE),
+        ("byStreamID", BYTE * 32),
+        ("byCourseFile", BYTE),
+        ("byDownload", BYTE),
+        ("byOptimalStreamType", BYTE),
+        ("byVODFileType", BYTE),
+        ("byRes", BYTE * 26),
+    ]
+
+
+class NET_DVR_TIME_SEARCH(ctypes.Structure):
+    _fields_ = [
+        ("wYear", WORD),
+        ("byMonth", BYTE),
+        ("byDay", BYTE),
+        ("byHour", BYTE),
+        ("byMinute", BYTE),
+        ("bySecond", BYTE),
+        ("cTimeDifferenceH", ctypes.c_char),
+        ("cTimeDifferenceM", ctypes.c_char),
+        ("byLocalOrUTC", BYTE),
+        ("wMillisecond", WORD),
+    ]
+
+
+class NET_DVR_TIME_SEARCH_COND(ctypes.Structure):
+    _fields_ = [
+        ("wYear", WORD),
+        ("byMonth", BYTE),
+        ("byDay", BYTE),
+        ("byHour", BYTE),
+        ("byMinute", BYTE),
+        ("bySecond", BYTE),
+        ("byLocalOrUTC", BYTE),
+        ("wMillisecond", WORD),
+        ("cTimeDifferenceH", ctypes.c_char),
+        ("cTimeDifferenceM", ctypes.c_char),
+    ]
+
+
+class NET_DVR_IPADDR(ctypes.Structure):
+    _fields_ = [
+        ("sIpV4", ctypes.c_char * 16),
+        ("byIPv6", BYTE * 128),
+    ]
+
+
 class NET_DVR_FILECOND(ctypes.Structure):
     _fields_ = [
         ("lChannel", LONG),
@@ -207,6 +284,63 @@ class NET_DVR_FINDDATA_V30(ctypes.Structure):
         ("byLocked", BYTE),
         ("byFileType", BYTE),
         ("byRes", BYTE * 2),
+    ]
+
+
+class NET_DVR_ADDRESS(ctypes.Structure):
+    _fields_ = [
+        ("struIP", NET_DVR_IPADDR),
+        ("wPort", WORD),
+        ("byRes", BYTE * 2),
+    ]
+
+
+class NET_DVR_SPECIAL_FINDINFO_UNION(ctypes.Union):
+    _fields_ = [
+        ("byLen", BYTE * 400),
+    ]
+
+
+class NET_DVR_FINDDATA_V50(ctypes.Structure):
+    _fields_ = [
+        ("sFileName", ctypes.c_char * 100),
+        ("struStartTime", NET_DVR_TIME_SEARCH),
+        ("struStopTime", NET_DVR_TIME_SEARCH),
+        ("struAddr", NET_DVR_ADDRESS),
+        ("dwFileSize", DWORD),
+        ("byLocked", BYTE),
+        ("byFileType", BYTE),
+        ("byQuickSearch", BYTE),
+        ("byStreamType", BYTE),
+        ("dwFileIndex", DWORD),
+        ("sCardNum", ctypes.c_char * 32),
+        ("dwTotalLenH", DWORD),
+        ("dwTotalLenL", DWORD),
+        ("byBigFileType", BYTE),
+        ("byRes", BYTE * 247),
+    ]
+
+
+class NET_DVR_FILECOND_V50(ctypes.Structure):
+    _fields_ = [
+        ("struStreamID", NET_DVR_STREAM_INFO),
+        ("struStartTime", NET_DVR_TIME_SEARCH_COND),
+        ("struStopTime", NET_DVR_TIME_SEARCH_COND),
+        ("byFindType", BYTE),
+        ("byDrawFrame", BYTE),
+        ("byQuickSearch", BYTE),
+        ("byStreamType", BYTE),
+        ("dwFileType", DWORD),
+        ("dwVolumeNum", DWORD),
+        ("byIsLocked", BYTE),
+        ("byNeedCard", BYTE),
+        ("byOnlyAudioFile", BYTE),
+        ("bySpecialFindInfoType", BYTE),
+        ("szCardNum", ctypes.c_char * 32),
+        ("szWorkingDeviceGUID", ctypes.c_char * 16),
+        ("uSpecialFindInfo", NET_DVR_SPECIAL_FINDINFO_UNION),
+        ("dwTimeout", DWORD),
+        ("byRes", BYTE * 252),
     ]
 
 
@@ -426,6 +560,21 @@ def _datetime_to_sdk_time(value: datetime) -> NET_DVR_TIME:
     return sdk_time
 
 
+def _datetime_to_sdk_time_search_cond(value: datetime) -> NET_DVR_TIME_SEARCH_COND:
+    sdk_time = NET_DVR_TIME_SEARCH_COND()
+    sdk_time.wYear = int(value.year)
+    sdk_time.byMonth = int(value.month)
+    sdk_time.byDay = int(value.day)
+    sdk_time.byHour = int(value.hour)
+    sdk_time.byMinute = int(value.minute)
+    sdk_time.bySecond = int(value.second)
+    sdk_time.byLocalOrUTC = 0
+    sdk_time.wMillisecond = 0
+    sdk_time.cTimeDifferenceH = b"\x00"
+    sdk_time.cTimeDifferenceM = b"\x00"
+    return sdk_time
+
+
 def _sdk_time_to_datetime(value: NET_DVR_TIME) -> datetime | None:
     try:
         return datetime(
@@ -435,6 +584,20 @@ def _sdk_time_to_datetime(value: NET_DVR_TIME) -> datetime | None:
             int(value.dwHour),
             int(value.dwMinute),
             int(value.dwSecond),
+        )
+    except Exception:
+        return None
+
+
+def _sdk_time_search_to_datetime(value: NET_DVR_TIME_SEARCH) -> datetime | None:
+    try:
+        return datetime(
+            int(value.wYear),
+            int(value.byMonth),
+            int(value.byDay),
+            int(value.byHour),
+            int(value.byMinute),
+            int(value.bySecond),
         )
     except Exception:
         return None
@@ -519,15 +682,55 @@ class NativeHCNetSDK:
         self._sdk.NET_DVR_Logout.argtypes = [LONG]
         self._sdk.NET_DVR_Logout.restype = ctypes.c_bool
 
-        if hasattr(self._sdk, "NET_DVR_FindFile_V30"):
-            self._sdk.NET_DVR_FindFile_V30.argtypes = [LONG, ctypes.POINTER(NET_DVR_FILECOND)]
-            self._sdk.NET_DVR_FindFile_V30.restype = LONG
-        if hasattr(self._sdk, "NET_DVR_FindNextFile_V30"):
-            self._sdk.NET_DVR_FindNextFile_V30.argtypes = [LONG, ctypes.POINTER(NET_DVR_FINDDATA_V30)]
-            self._sdk.NET_DVR_FindNextFile_V30.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_FindFile_V50"):
+            self._sdk.NET_DVR_FindFile_V50.argtypes = [LONG, ctypes.POINTER(NET_DVR_FILECOND_V50)]
+            self._sdk.NET_DVR_FindFile_V50.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_FindNextFile_V50"):
+            self._sdk.NET_DVR_FindNextFile_V50.argtypes = [LONG, ctypes.POINTER(NET_DVR_FINDDATA_V50)]
+            self._sdk.NET_DVR_FindNextFile_V50.restype = LONG
         if hasattr(self._sdk, "NET_DVR_FindClose_V30"):
             self._sdk.NET_DVR_FindClose_V30.argtypes = [LONG]
             self._sdk.NET_DVR_FindClose_V30.restype = ctypes.c_bool
+        if hasattr(self._sdk, "NET_DVR_PlayBackByTime_V40"):
+            self._sdk.NET_DVR_PlayBackByTime_V40.argtypes = [LONG, ctypes.POINTER(NET_DVR_VOD_PARA)]
+            self._sdk.NET_DVR_PlayBackByTime_V40.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_StopPlayBack"):
+            self._sdk.NET_DVR_StopPlayBack.argtypes = [LONG]
+            self._sdk.NET_DVR_StopPlayBack.restype = BOOL
+        if hasattr(self._sdk, "NET_DVR_PlayBackControl_V40"):
+            self._sdk.NET_DVR_PlayBackControl_V40.argtypes = [
+                LONG,
+                DWORD,
+                ctypes.c_void_p,
+                DWORD,
+                ctypes.c_void_p,
+                ctypes.c_void_p,
+            ]
+            self._sdk.NET_DVR_PlayBackControl_V40.restype = BOOL
+        if hasattr(self._sdk, "NET_DVR_PlayBackControl"):
+            self._sdk.NET_DVR_PlayBackControl.argtypes = [LONG, DWORD, DWORD, ctypes.POINTER(DWORD)]
+            self._sdk.NET_DVR_PlayBackControl.restype = BOOL
+        if hasattr(self._sdk, "NET_DVR_SetPlayDataCallBack_V40"):
+            self._sdk.NET_DVR_SetPlayDataCallBack_V40.argtypes = [LONG, REALDATACALLBACK, ctypes.c_void_p]
+            self._sdk.NET_DVR_SetPlayDataCallBack_V40.restype = BOOL
+        if hasattr(self._sdk, "NET_DVR_GetFileByTime_V40"):
+            self._sdk.NET_DVR_GetFileByTime_V40.argtypes = [LONG, ctypes.c_char_p, ctypes.POINTER(NET_DVR_PLAYCOND)]
+            self._sdk.NET_DVR_GetFileByTime_V40.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_GetFileByTime"):
+            self._sdk.NET_DVR_GetFileByTime.argtypes = [
+                LONG,
+                LONG,
+                ctypes.POINTER(NET_DVR_TIME),
+                ctypes.POINTER(NET_DVR_TIME),
+                ctypes.c_char_p,
+            ]
+            self._sdk.NET_DVR_GetFileByTime.restype = LONG
+        if hasattr(self._sdk, "NET_DVR_StopGetFile"):
+            self._sdk.NET_DVR_StopGetFile.argtypes = [LONG]
+            self._sdk.NET_DVR_StopGetFile.restype = BOOL
+        if hasattr(self._sdk, "NET_DVR_GetDownloadPos"):
+            self._sdk.NET_DVR_GetDownloadPos.argtypes = [LONG]
+            self._sdk.NET_DVR_GetDownloadPos.restype = LONG
 
     def init(self) -> None:
         ok = bool(self._sdk.NET_DVR_Init())
@@ -566,7 +769,6 @@ class NativeHCNetSDK:
             login_info.sUserName = username_bytes[:63]
             login_info.sPassword = password_bytes[:63]
             login_info.bUseAsynLogin = 0
-            login_info.byLoginMode = 2
             login_info.byHttps = 0
 
             device_info_v40 = NET_DVR_DEVICEINFO_V40()
@@ -611,55 +813,114 @@ class NativeHCNetSDK:
         file_type: int,
         stream_type: int,
     ) -> list[NativeArchiveItem]:
-        del stream_type
-        if not hasattr(self._sdk, "NET_DVR_FindFile_V30"):
-            raise RuntimeError("NET_DVR_FindFile_V30 unavailable")
+        if not hasattr(self._sdk, "NET_DVR_FindFile_V50"):
+            raise RuntimeError("NET_DVR_FindFile_V50 unavailable")
 
-        cond = NET_DVR_FILECOND()
+        cond = NET_DVR_FILECOND_V50()
         ctypes.memset(ctypes.byref(cond), 0, ctypes.sizeof(cond))
-        cond.lChannel = int(channel)
+        cond.struStreamID.dwSize = ctypes.sizeof(NET_DVR_STREAM_INFO)
+        cond.struStreamID.dwChannel = int(channel)
+        cond.struStartTime = _datetime_to_sdk_time_search_cond(start_time)
+        cond.struStopTime = _datetime_to_sdk_time_search_cond(end_time)
         cond.dwFileType = int(file_type)
-        cond.struStartTime = _datetime_to_sdk_time(start_time)
-        cond.struStopTime = _datetime_to_sdk_time(end_time)
+        cond.byStreamType = int(stream_type)
+        cond.byIsLocked = 0xFF
 
-        find_handle = int(self._sdk.NET_DVR_FindFile_V30(LONG(int(user_id)), ctypes.byref(cond)))
+        find_handle = int(self._sdk.NET_DVR_FindFile_V50(LONG(int(user_id)), ctypes.byref(cond)))
         if find_handle < 0 or find_handle == 0xFFFFFFFF:
-            raise RuntimeError(f"NET_DVR_FindFile_V30 failed: error={self.get_last_error()}")
+            raise RuntimeError(f"NET_DVR_FindFile_V50 failed: error={self.get_last_error()}")
 
         items: list[NativeArchiveItem] = []
         searching_count = 0
         try:
             while True:
-                find_data = NET_DVR_FINDDATA_V30()
-                ret = int(self._sdk.NET_DVR_FindNextFile_V30(LONG(find_handle), ctypes.byref(find_data)))
-                if ret == 200:
+                find_data = NET_DVR_FINDDATA_V50()
+                ctypes.memset(ctypes.byref(find_data), 0, ctypes.sizeof(find_data))
+                ret = int(self._sdk.NET_DVR_FindNextFile_V50(LONG(find_handle), ctypes.byref(find_data)))
+                if ret == 1000:
                     searching_count = 0
                     items.append(
                         NativeArchiveItem(
                             filename=_decode_zero_terminated(find_data.sFileName),
-                            start_time=_sdk_time_to_datetime(find_data.struStartTime),
-                            end_time=_sdk_time_to_datetime(find_data.struStopTime),
+                            start_time=_sdk_time_search_to_datetime(find_data.struStartTime),
+                            end_time=_sdk_time_search_to_datetime(find_data.struStopTime),
                             file_size=int(find_data.dwFileSize),
                         )
                     )
                     continue
-                if ret == 201:
+                if ret == 1002:
                     searching_count += 1
                     if searching_count > 50:
                         break
-                    time.sleep(0.05)
+                    time.sleep(0.01)
                     continue
-                if ret == 202:
+                if ret in {1001, 1003}:
                     break
                 if ret == 0:
                     break
                 raise RuntimeError(
-                    f"NET_DVR_FindNextFile_V30 failed: ret={ret} error={self.get_last_error()}"
+                    f"NET_DVR_FindNextFile_V50 failed: ret={ret} error={self.get_last_error()}"
                 )
         finally:
             if hasattr(self._sdk, "NET_DVR_FindClose_V30"):
                 self._sdk.NET_DVR_FindClose_V30(LONG(find_handle))
         return items
+
+    def start_download_by_time(self, *, user_id: int, request: ArchiveDownloadRequest) -> int:
+        handle = -1
+        saved_file_name = str(request.save_path).encode("utf-8")
+        start_call_name = "NET_DVR_GetFileByTime_V40"
+
+        if hasattr(self._sdk, "NET_DVR_GetFileByTime_V40"):
+            cond = NET_DVR_PLAYCOND()
+            ctypes.memset(ctypes.byref(cond), 0, ctypes.sizeof(cond))
+            cond.dwChannel = int(request.channel)
+            cond.struStartTime = _datetime_to_sdk_time(request.start_time)
+            cond.struStopTime = _datetime_to_sdk_time(request.end_time)
+            cond.byDrawFrame = 0
+            cond.byStreamType = int(request.stream_type)
+            cond.byCourseFile = 0
+            cond.byDownload = 1
+            cond.byOptimalStreamType = 1 if request.use_best_stream else 0
+            cond.byVODFileType = 0
+            handle = int(self._sdk.NET_DVR_GetFileByTime_V40(LONG(int(user_id)), saved_file_name, ctypes.byref(cond)))
+        elif hasattr(self._sdk, "NET_DVR_GetFileByTime"):
+            start_call_name = "NET_DVR_GetFileByTime"
+            start_time = _datetime_to_sdk_time(request.start_time)
+            end_time = _datetime_to_sdk_time(request.end_time)
+            handle = int(
+                self._sdk.NET_DVR_GetFileByTime(
+                    LONG(int(user_id)),
+                    LONG(int(request.channel)),
+                    ctypes.byref(start_time),
+                    ctypes.byref(end_time),
+                    saved_file_name,
+                )
+            )
+        else:
+            raise RuntimeError("HCNetSDK download-by-time API is unavailable")
+
+        if handle < 0:
+            raise RuntimeError(f"{start_call_name} failed: error={self.get_last_error()}")
+
+        if hasattr(self._sdk, "NET_DVR_PlayBackControl"):
+            out_value = DWORD(0)
+            ok = bool(self._sdk.NET_DVR_PlayBackControl(LONG(handle), DWORD(NET_DVR_PLAYSTART), DWORD(0), ctypes.byref(out_value)))
+            if not ok:
+                if hasattr(self._sdk, "NET_DVR_StopGetFile"):
+                    self._sdk.NET_DVR_StopGetFile(LONG(handle))
+                raise RuntimeError(f"NET_DVR_PlayBackControl(PLAYSTART) failed: error={self.get_last_error()}")
+        return handle
+
+    def get_download_pos(self, handle: int) -> int:
+        if not hasattr(self._sdk, "NET_DVR_GetDownloadPos"):
+            raise RuntimeError("NET_DVR_GetDownloadPos unavailable")
+        return int(self._sdk.NET_DVR_GetDownloadPos(LONG(int(handle))))
+
+    def stop_get_file(self, handle: int) -> bool:
+        if not hasattr(self._sdk, "NET_DVR_StopGetFile"):
+            raise RuntimeError("NET_DVR_StopGetFile unavailable")
+        return bool(self._sdk.NET_DVR_StopGetFile(LONG(int(handle))))
 
 
 class HikvisionDeviceService:
@@ -922,6 +1183,7 @@ class HikvisionDeviceService:
         isapi_channel = self._sdk_channel_to_isapi(channel)
         if isapi_channel is None:
             return None
+        isapi_track = self._isapi_channel_to_track_id(isapi_channel, stream_no=1)
 
         request_body = (
             '<?xml version="1.0" encoding="utf-8"?>'
@@ -930,8 +1192,7 @@ class HikvisionDeviceService:
             f"<monthOfYear>{int(month)}</monthOfYear>"
             "</trackDailyParam>"
         ).encode("utf-8")
-        request_url = f"POST /ISAPI/ContentMgmt/record/tracks/{isapi_channel}/dailyDistribution"
-
+        request_url = f"POST /ISAPI/ContentMgmt/record/tracks/{isapi_track}/dailyDistribution"
         try:
             response_xml = self._stdxml_request(
                 request_url=request_url,
@@ -957,23 +1218,30 @@ class HikvisionDeviceService:
 
             self._last_error = ""
             logger.info(
-                "archive_days isapi loaded count=%s sdk_channel=%s isapi_channel=%s month=%04d-%02d",
+                "archive_days isapi loaded count=%s sdk_channel=%s isapi_channel=%s isapi_track=%s month=%04d-%02d",
                 len(days),
                 channel,
                 isapi_channel,
+                isapi_track,
                 year,
                 month,
             )
             return days
         except Exception as exc:
             logger.warning(
-                "archive_days isapi unavailable sdk_channel=%s month=%04d-%02d: %s",
+                "archive_days isapi unavailable sdk_channel=%s isapi_channel=%s isapi_track=%s month=%04d-%02d: %s",
                 channel,
+                isapi_channel,
+                isapi_track,
                 year,
                 month,
                 exc,
             )
             return None
+
+    @staticmethod
+    def _isapi_channel_to_track_id(isapi_channel: int, *, stream_no: int = 1) -> int:
+        return int(isapi_channel) * 100 + int(stream_no)
 
     def _sdk_channel_to_isapi(self, sdk_channel: int) -> int | None:
         if self._mode != "real" or self._device is None or self._sdk is None:
@@ -987,11 +1255,15 @@ class HikvisionDeviceService:
             sdk = self._sdk._sdk
             if not hasattr(sdk, "NET_DVR_SDKChannelToISAPI"):
                 return None
-            sdk.NET_DVR_SDKChannelToISAPI.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_bool]
-            sdk.NET_DVR_SDKChannelToISAPI.restype = ctypes.c_int
+            sdk.NET_DVR_SDKChannelToISAPI.argtypes = [LONG, LONG, BOOL]
+            sdk.NET_DVR_SDKChannelToISAPI.restype = LONG
             with self._sdk_lock:
                 isapi_channel = int(
-                    sdk.NET_DVR_SDKChannelToISAPI(self._device.user_id, int(sdk_channel), True)
+                    sdk.NET_DVR_SDKChannelToISAPI(
+                        LONG(int(self._device.user_id)),
+                        LONG(int(sdk_channel)),
+                        BOOL(1),
+                    )
                 )
             if isapi_channel < 0:
                 error_code = self._sdk.get_last_error()
@@ -1202,6 +1474,77 @@ class HikvisionDeviceService:
             index += 1
         return files
 
+    def download_by_time(
+        self,
+        request: ArchiveDownloadRequest,
+        *,
+        progress_callback: Any | None = None,
+    ) -> ArchiveDownloadResult:
+        sdk_wrapper = self._sdk
+        device = self._device
+        if self._mode != "real" or device is None or sdk_wrapper is None:
+            raise RuntimeError("Archive download is available only in real mode")
+        if request.end_time <= request.start_time:
+            raise RuntimeError("Archive download end_time must be greater than start_time")
+
+        save_path = Path(request.save_path).expanduser()
+        if save_path.exists() and save_path.is_dir():
+            raise RuntimeError(f"Archive download path points to a directory: {save_path}")
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+
+        def _emit(progress_percent: int, state: str) -> None:
+            if progress_callback is None:
+                return
+            progress_callback(
+                ArchiveDownloadProgress(
+                    request=request,
+                    progress_percent=max(0, min(int(progress_percent), 100)),
+                    state=state,
+                )
+            )
+
+        handle = -1
+        last_pos = -1
+        try:
+            _emit(0, "starting")
+            with self._sdk_lock:
+                handle = sdk_wrapper.start_download_by_time(user_id=device.user_id, request=request)
+            self._last_error = ""
+
+            while True:
+                with self._sdk_lock:
+                    pos = sdk_wrapper.get_download_pos(handle)
+                if pos != last_pos and 0 <= pos <= 100:
+                    _emit(pos, "downloading")
+                    last_pos = pos
+                if pos >= 100:
+                    break
+                if pos < 0 or pos > 100:
+                    error_code = sdk_wrapper.get_last_error()
+                    raise RuntimeError(
+                        "NET_DVR_GetDownloadPos returned invalid value: "
+                        f"pos={pos} error={error_code}"
+                    )
+                time.sleep(0.2)
+
+            _emit(100, "completed")
+            return ArchiveDownloadResult(
+                request=request,
+                save_path=str(save_path),
+                bytes_written=save_path.stat().st_size if save_path.exists() else 0,
+                completed_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        except Exception as exc:
+            self._last_error = str(exc)
+            raise
+        finally:
+            if handle >= 0:
+                try:
+                    with self._sdk_lock:
+                        sdk_wrapper.stop_get_file(handle)
+                except Exception:
+                    pass
+
     def playback_by_time(
         self,
         *,
@@ -1211,34 +1554,13 @@ class HikvisionDeviceService:
         resume_time: datetime,
         callback: Any,
     ) -> int:
-        if self._mode != "real" or self._device is None or self._sdk is None:
+        sdk_wrapper = self._sdk
+        device = self._device
+        if self._mode != "real" or device is None or sdk_wrapper is None:
             return -1
 
         try:
-            class NET_DVR_VOD_PARA(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", DWORD),
-                    ("struIDInfo", NET_DVR_STREAM_INFO),
-                    ("struBeginTime", NET_DVR_TIME),
-                    ("struEndTime", NET_DVR_TIME),
-                    ("hWnd", HWND),
-                    ("byDrawFrame", BYTE),
-                    ("byVolumeType", BYTE),
-                    ("byVolumeNum", BYTE),
-                    ("byStreamType", BYTE),
-                    ("dwFileIndex", DWORD),
-                    ("byAudioFile", BYTE),
-                    ("byCourseFile", BYTE),
-                    ("byDownload", BYTE),
-                    ("byOptimalStreamType", BYTE),
-                    ("byUseAsyn", BYTE),
-                    ("byRes2", BYTE * 19),
-                ]
-
-            sdk = self._sdk._sdk
-            sdk.NET_DVR_PlayBackByTime_V40.argtypes = [ctypes.c_int, ctypes.POINTER(NET_DVR_VOD_PARA)]
-            sdk.NET_DVR_PlayBackByTime_V40.restype = ctypes.c_int
-
+            sdk = sdk_wrapper._sdk
             vod = NET_DVR_VOD_PARA()
             ctypes.memset(ctypes.byref(vod), 0, ctypes.sizeof(vod))
             vod.dwSize = ctypes.sizeof(NET_DVR_VOD_PARA)
@@ -1258,8 +1580,7 @@ class HikvisionDeviceService:
             vod.struEndTime.dwSecond = end_time.second
             vod.hWnd = 0
             vod.byStreamType = 0
-            vod.byOptimalStreamType = 1
-            vod.byUseAsyn = 1
+            vod.byUseAsyn = 0
 
             play_begin = min(max(resume_time, start_time), end_time)
             vod.struBeginTime.dwYear = play_begin.year
@@ -1270,9 +1591,9 @@ class HikvisionDeviceService:
             vod.struBeginTime.dwSecond = play_begin.second
 
             with self._sdk_lock:
-                handle = sdk.NET_DVR_PlayBackByTime_V40(self._device.user_id, ctypes.byref(vod))
+                handle = sdk.NET_DVR_PlayBackByTime_V40(device.user_id, ctypes.byref(vod))
             if handle < 0:
-                error_code = self._sdk.get_last_error()
+                error_code = sdk_wrapper.get_last_error()
                 self._last_error = (
                     "NET_DVR_PlayBackByTime_V40 failed: "
                     f"{self._format_sdk_error(error_code)}"
@@ -1288,11 +1609,11 @@ class HikvisionDeviceService:
                     pass
 
             c_callback = REALDATACALLBACK(_callback_wrapper)
-            self._device._callbacks.append(c_callback)
+            device._callbacks.append(c_callback)
             with self._sdk_lock:
                 callback_ok = sdk.NET_DVR_SetPlayDataCallBack_V40(handle, c_callback, None)
             if not callback_ok:
-                error_code = self._sdk.get_last_error()
+                error_code = sdk_wrapper.get_last_error()
                 self._last_error = f"NET_DVR_SetPlayDataCallBack_V40 failed: error={error_code}"
                 logger.warning("%s", self._last_error)
                 with self._sdk_lock:
@@ -1315,37 +1636,16 @@ class HikvisionDeviceService:
         resume_time: datetime,
         hwnd: int,
     ) -> int:
-        if self._mode != "real" or self._device is None or self._sdk is None:
+        sdk_wrapper = self._sdk
+        device = self._device
+        if self._mode != "real" or device is None or sdk_wrapper is None:
             return -1
         if int(hwnd) <= 0:
             self._last_error = "playback_by_time_hwnd requires a valid window id"
             return -1
 
         try:
-            class NET_DVR_VOD_PARA(ctypes.Structure):
-                _fields_ = [
-                    ("dwSize", DWORD),
-                    ("struIDInfo", NET_DVR_STREAM_INFO),
-                    ("struBeginTime", NET_DVR_TIME),
-                    ("struEndTime", NET_DVR_TIME),
-                    ("hWnd", HWND),
-                    ("byDrawFrame", BYTE),
-                    ("byVolumeType", BYTE),
-                    ("byVolumeNum", BYTE),
-                    ("byStreamType", BYTE),
-                    ("dwFileIndex", DWORD),
-                    ("byAudioFile", BYTE),
-                    ("byCourseFile", BYTE),
-                    ("byDownload", BYTE),
-                    ("byOptimalStreamType", BYTE),
-                    ("byUseAsyn", BYTE),
-                    ("byRes2", BYTE * 19),
-                ]
-
-            sdk = self._sdk._sdk
-            sdk.NET_DVR_PlayBackByTime_V40.argtypes = [ctypes.c_int, ctypes.POINTER(NET_DVR_VOD_PARA)]
-            sdk.NET_DVR_PlayBackByTime_V40.restype = ctypes.c_int
-
+            sdk = sdk_wrapper._sdk
             vod = NET_DVR_VOD_PARA()
             ctypes.memset(ctypes.byref(vod), 0, ctypes.sizeof(vod))
             vod.dwSize = ctypes.sizeof(NET_DVR_VOD_PARA)
@@ -1365,8 +1665,7 @@ class HikvisionDeviceService:
             vod.struEndTime.dwSecond = end_time.second
             vod.hWnd = HWND(int(hwnd))
             vod.byStreamType = 0
-            vod.byOptimalStreamType = 1
-            vod.byUseAsyn = 1
+            vod.byUseAsyn = 0
 
             play_begin = min(max(resume_time, start_time), end_time)
             vod.struBeginTime.dwYear = play_begin.year
@@ -1377,9 +1676,9 @@ class HikvisionDeviceService:
             vod.struBeginTime.dwSecond = play_begin.second
 
             with self._sdk_lock:
-                handle = sdk.NET_DVR_PlayBackByTime_V40(self._device.user_id, ctypes.byref(vod))
+                handle = sdk.NET_DVR_PlayBackByTime_V40(device.user_id, ctypes.byref(vod))
             if handle < 0:
-                error_code = self._sdk.get_last_error()
+                error_code = sdk_wrapper.get_last_error()
                 self._last_error = (
                     "NET_DVR_PlayBackByTime_V40 failed: "
                     f"{self._format_sdk_error(error_code)}"
@@ -1402,11 +1701,12 @@ class HikvisionDeviceService:
         in_buffer: ctypes.Structure | None = None,
         out_buffer: ctypes.Structure | None = None,
     ) -> tuple[bool, int]:
-        if self._mode != "real" or self._device is None or self._sdk is None:
+        sdk_wrapper = self._sdk
+        if self._mode != "real" or self._device is None or sdk_wrapper is None:
             return False, 0
 
         try:
-            sdk = self._sdk._sdk
+            sdk = sdk_wrapper._sdk
             in_ptr = ctypes.byref(in_buffer) if in_buffer is not None else None
             in_len = ctypes.sizeof(in_buffer) if in_buffer is not None else 0
             out_ptr = ctypes.byref(out_buffer) if out_buffer is not None else None
@@ -1422,7 +1722,7 @@ class HikvisionDeviceService:
                     out_len_ptr,
                 )
             if not ok:
-                error_code = self._sdk.get_last_error()
+                error_code = sdk_wrapper.get_last_error()
                 self._last_error = f"NET_DVR_PlayBackControl_V40 failed: command={command}, error={error_code}"
             else:
                 self._last_error = ""
@@ -1465,12 +1765,13 @@ class HikvisionDeviceService:
         return ok
 
     def stop_playback(self, handle: int) -> bool:
+        sdk_wrapper = self._sdk
         if self._mode != "real" or self._device is None:
             return True
 
         try:
             control_ok, _ = self.playback_control_v40(handle, NET_DVR_PLAYSTOP, in_buffer=None, out_buffer=None)
-            sdk = self._sdk._sdk if self._sdk is not None else None
+            sdk = sdk_wrapper._sdk if sdk_wrapper is not None else None
             if sdk is not None and hasattr(sdk, "NET_DVR_StopPlayBack"):
                 with self._sdk_lock:
                     sdk.NET_DVR_StopPlayBack(handle)
@@ -1526,13 +1827,6 @@ DIGITAL_STATUS_TEXT = {
     23: ("ACTIVATING", False, False, "IPC activating"),
     24: ("TOKEN AUTH FAILED", False, False, "Token authentication failed"),
 }
-
-
-class NET_DVR_IPADDR(ctypes.Structure):
-    _fields_ = [
-        ("sIpV4", ctypes.c_char * 16),
-        ("byIPv6", ctypes.c_ubyte * 128),
-    ]
 
 
 class NET_DVR_IPDEVINFO_V31(ctypes.Structure):
@@ -2292,6 +2586,7 @@ class HikvisionPlugin:
         return PluginCapabilities(
             supports_live=supports_live,
             supports_archive=True,
+            supports_archive_download=supports_live,
             supports_native_surface_binding=True,
             supports_grid_low_res_profile=supports_live,
             supports_profile_switch=supports_live,
@@ -2329,6 +2624,15 @@ class HikvisionPlugin:
             )
             for item in self.list_archive_files(channel, day)
         ]
+
+    def download_archive_by_time(
+        self,
+        *,
+        request: ArchiveDownloadRequest,
+        progress_callback: Any | None = None,
+    ) -> ArchiveDownloadResult:
+        self.ensure_connected()
+        return self.service.download_by_time(request, progress_callback=progress_callback)
 
     def start_archive_playback(
         self,

@@ -12,6 +12,9 @@ gi.require_version("GLib", "2.0")
 from gi.repository import GLib
 
 from contracts import (
+    ArchiveDownloadProgress,
+    ArchiveDownloadRequest,
+    ArchiveDownloadResult,
     ChannelInfo,
     ConnectionParams,
     DiagnosticState,
@@ -29,12 +32,14 @@ from hikvision_plugin import HikvisionPlugin
 
 ResultCallback = Callable[[Any], None]
 ErrorCallback = Callable[[str], None]
+DownloadProgressCallback = Callable[[ArchiveDownloadProgress], None]
 
 
 class ApplicationCore:
     def __init__(self) -> None:
         self.plugin = HikvisionPlugin()
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gtk-core")
+        self.download_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="gtk-download")
         self.base_dir = Path(__file__).resolve().parent
         self.data_dir = self.base_dir / ".data"
         self.runtime_config_path = self.data_dir / "runtime_config.json"
@@ -169,6 +174,7 @@ class ApplicationCore:
     def shutdown(self) -> None:
         self.plugin.disconnect()
         self.executor.shutdown(wait=False, cancel_futures=True)
+        self.download_executor.shutdown(wait=False, cancel_futures=True)
 
     def load_runtime_config(self) -> RuntimeConfig | None:
         try:
@@ -189,8 +195,14 @@ class ApplicationCore:
         )
         self.runtime_config = config
 
-    def _submit(self, fn: Callable[[], Any], on_done: ResultCallback, on_error: ErrorCallback) -> Future[Any]:
-        future = self.executor.submit(fn)
+    def _submit_with_executor(
+        self,
+        executor: ThreadPoolExecutor,
+        fn: Callable[[], Any],
+        on_done: ResultCallback,
+        on_error: ErrorCallback,
+    ) -> Future[Any]:
+        future = executor.submit(fn)
 
         def _finish(done_future: Future[Any]) -> None:
             try:
@@ -202,6 +214,9 @@ class ApplicationCore:
 
         future.add_done_callback(_finish)
         return future
+
+    def _submit(self, fn: Callable[[], Any], on_done: ResultCallback, on_error: ErrorCallback) -> Future[Any]:
+        return self._submit_with_executor(self.executor, fn, on_done, on_error)
 
     def run_initial_diagnostic(
         self,
@@ -518,6 +533,27 @@ class ApplicationCore:
             on_done,
             on_error,
         )
+
+    def download_archive_by_time(
+        self,
+        *,
+        request: ArchiveDownloadRequest,
+        on_done: Callable[[ArchiveDownloadResult], None],
+        on_error: ErrorCallback,
+        on_progress: DownloadProgressCallback | None = None,
+    ) -> Future[Any]:
+        def _job() -> ArchiveDownloadResult:
+            def _report_progress(progress: ArchiveDownloadProgress) -> None:
+                if on_progress is None:
+                    return
+                GLib.idle_add(lambda progress_value=progress: on_progress(progress_value))
+
+            return self.plugin.download_archive_by_time(
+                request=request,
+                progress_callback=_report_progress if on_progress is not None else None,
+            )
+
+        return self._submit_with_executor(self.download_executor, _job, on_done, on_error)
 
     def start_live_preview(
         self,

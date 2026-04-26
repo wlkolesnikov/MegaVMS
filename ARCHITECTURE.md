@@ -1,220 +1,264 @@
 # GTK Architecture
 
+## Статус документа
+
+Этот документ приведён к фактическому состоянию `sdk-hik-GTK` в репозитории.
+Он описывает:
+
+- что реально реализовано сейчас;
+- какие контракты использует код;
+- какие части остаются roadmap, а не текущей функциональностью.
+
+Если `TODO.md` и код расходятся с этим документом, источником истины считается код.
+
+---
+
 ## Цель
 
-Новая версия приложения должна решать три задачи одновременно:
+GTK-версия решает три практические задачи:
 
 1. уйти от зависимости на `Qt/PySide6`;
-2. уйти от внешней Python-обёртки `hikvision_sdk`;
-3. заложить основу для поддержки разных производителей через внутренние контракты и плагины.
+2. работать напрямую через локальный Hikvision backend, без старой внешней Python-обёртки;
+3. держать UI и backend разделёнными так, чтобы позже можно было добавить второй vendor plugin.
 
-GTK-версия рассматривается не как "переписанный Hikvision player", а как
-единая платформа видеонаблюдения с несколькими backend-плагинами.
-
----
-
-## Архитектурные принципы
-
-### 1. UI не знает о vendor SDK
-
-GTK UI не должен знать ничего о:
-
-- `HCNetSDK`
-- `PlayCtrl`
-- `NET_DVR_*`
-- `GStreamer pipeline details`
-- `rtsp/http/isapi` URL construction
-
-UI работает только с внутренними контрактами приложения.
-
-### 2. Плагин реализует backend, а не диктует UI
-
-Каждый backend-плагин скрывает свою механику:
-
-- `hikvision_plugin.py`
-  - `HCNetSDK`
-  - `PlayCtrl`
-  - native window binding
-  - native zoom/speed/frame-step
-
-- `macroscop.py`
-  - `GStreamer`
-  - URL/pipeline construction
-  - stream profile switching
-  - seek/rate through `Gst`
-
-UI получает единое поведение через capability-driven contracts.
-
-### 3. Минимизируем число файлов, но не смешиваем слои
-
-Целевая GTK-версия должна держаться в компактной структуре:
-
-- `contracts.py`
-- `core.py`
-- `hikvision_plugin.py`
-- `macroscop.py`
-- `ui.py`
-- `timeline.py`
-
-Это минимальный разумный набор файлов.
-
-Нельзя:
-
-- смешивать UI и SDK binding в одном файле;
-- смешивать timeline math и vendor-specific playback;
-- распиливать проект на большое количество мелких helper-файлов.
-
-### 4. Capability-first design
-
-Backends будут асимметричны:
-
-- Hikvision владеет декодером и рендером через SDK/PlayCtrl;
-- другой backend может работать через `GStreamer + gtksink`;
-- часть функций будет доступна только у отдельных backend.
-
-Поэтому contracts должны описывать:
-
-- доступные операции;
-- доступные возможности (`capabilities`);
-- особенности binding video surface.
+На текущем этапе это не универсальная multi-vendor платформа, а рабочая GTK-реализация с одним backend `HikvisionPlugin` и заделом под расширение.
 
 ---
 
-## Целевые режимы приложения
+## Реально реализованные режимы
 
-Архитектура строится вокруг режимов, а не вокруг одного архивного playback.
+### 1. `System / Diagnostics`
 
-### 1. `Live Grid`
+Реализовано:
 
-Функции:
+- первичное подключение;
+- сохранение `runtime_config.json`;
+- baseline по `enabled` каналам;
+- startup diagnostic;
+- periodic diagnostic;
+- табличный diff `baseline vs current`;
+- сохранение последнего diagnostic snapshot в runtime config.
 
-- показ нескольких каналов одновременно;
-- низкое разрешение / substream для grid;
-- обновление статуса online/offline;
-- быстрый переход к выбранной камере;
-- запрос скриншотов для ячеек grid.
+Текущая диагностика не строит отдельный machine-readable support report и не хранит расширенные device expectations уровня resolution/fps/profile.
 
-### 2. `Live Focus`
+### 2. `Archive`
 
-Функции:
+Реализовано:
 
-- раскрытие выбранной камеры в крупный режим или fullscreen;
-- переключение с low-res stream на main/high-res stream;
-- zoom;
-- возврат в grid с откатом на low-res stream.
-
-### 3. `Archive Playback`
-
-Функции:
-
-- запрос наличия архива;
-- список/интервалы архива;
-- timeline;
-- start/seek/pause/resume;
+- выбор канала;
+- календарь с подсветкой дней архива;
+- загрузка списка файлов за день;
+- построение archive segments на timeline;
+- native playback в X11 host;
+- seek по timeline;
+- `pause / resume`;
 - speed control;
-- frame-step;
-- zoom и pan, если backend поддерживает.
+- frame step;
+- polling текущего playback time и синхронизация курсора timeline;
+- native zoom/pan через SDK;
+- скачивание архива по диапазону времени;
+- очередь из нескольких download-задач;
+- выделенный download worker, не блокирующий остальные archive-запросы.
 
-### 4. `Diagnostics`
+Текущий archive API ориентирован на операции по одному каналу и в UI работает с архивом по выбранному дню плюс coverage report по произвольному периоду.
 
-Функции:
+### 3. `Online`
 
-- первичная диагностика устройства и каналов;
-- чтение текущей конфигурации;
-- сравнение с эталонной baseline-конфигурацией;
-- формирование диагностического отчёта для техподдержки.
+Реализовано:
 
-### 5. `Archive Report`
+- live grid;
+- live focus;
+- profiles `main/sub`;
+- запуск grid в `substream`, если backend это поддерживает;
+- запуск focus в `main stream`;
+- пользовательские `views` с layout presets и сохранением в runtime config;
+- боковая панель на `Gtk.Revealer` внутри popover;
+- transport controls `Play / Stop / Prev / Next`;
+- snapshots для каналов текущего вида;
+- отображение snapshot прямо в grid;
+- snapshot focus без запуска live focus;
+- явные состояния ячейки `live / snapshot / idle / error`.
 
-Функции:
+Не реализовано:
 
-- отчёт о наличии архива за произвольный период;
-- покрытие по каналам;
-- интервалы архива и интервалы дыр;
-- проценты покрытия;
-- экспорт в текстовый/JSON отчёт.
+- fullscreen-переход для focus view;
+- второй backend plugin.
+
+### 4. `Reports`
+
+Реализовано:
+
+- archive coverage report для одного выбранного канала;
+- произвольный период времени;
+- human-readable text output.
+
+Не реализовано:
+
+- multi-channel coverage report;
+- JSON export;
+- отдельный support report.
 
 ---
 
-## Внутренние контракты
+## Фактическая структура файлов
 
-Контракты должны описывать поведение, нужное UI, а не внутренний API SDK.
+```text
+sdk-hik-GTK/
+├── app.py
+├── contracts.py
+├── core.py
+├── hikvision_plugin.py
+├── timeline.py
+├── ui.py
+├── TODO.md
+└── ARCHITECTURE.md
+```
 
-### Базовые dataclass
+Дополнительного backend файла `macroscop.py` в текущей реализации нет.
 
-Минимальный набор доменных объектов:
+### Назначение файлов
+
+#### `app.py`
+
+- точка входа GTK-приложения;
+- создаёт `ApplicationCore`;
+- поднимает `MainWindow`.
+
+#### `contracts.py`
+
+- реальные dataclass-модели;
+- capability model;
+- runtime config serialization helpers.
+
+В текущем коде здесь нет `Protocol`/`ABC` и нет абстрактного plugin contract как Python interface.
+
+#### `core.py`
+
+- orchestration layer между UI и plugin;
+- фоновые executors;
+- возврат результатов в GTK thread через `GLib.idle_add`;
+- публичные операции для live/archive/diagnostics/report.
+
+#### `hikvision_plugin.py`
+
+- Hikvision-specific backend;
+- HCNetSDK binding;
+- archive/live/snapshot/diagnostic implementation;
+- native playback, zoom и transport controls.
+
+#### `timeline.py`
+
+- vendor-agnostic GTK timeline widget;
+- time-to-pixel math;
+- hit-testing;
+- drawing archive segments и cursor.
+
+#### `ui.py`
+
+- все вкладки GTK UI;
+- live grid/focus;
+- archive screen;
+- reports screen;
+- diagnostics screen;
+- download queue.
+
+---
+
+## Фактические доменные модели
+
+Сейчас в `contracts.py` реально используются:
 
 - `ConnectionParams`
-- `DeviceInfo`
-- `ChannelInfo`
+- `VideoHostBinding`
 - `StreamProfile`
+- `ZoomState`
+- `PluginCapabilities`
+- `ChannelInfo`
+- `OnlineView`
+- `ArchiveFile`
 - `ArchiveSegment`
+- `ArchiveDownloadRequest`
+- `ArchiveDownloadProgress`
+- `ArchiveDownloadResult`
+- `RuntimeConfig`
+- `DiagnosticReport`
+- `DiagnosticState`
+- `ArchiveCoverageReport`
+- `SnapshotResult`
+
+Из более ранних архитектурных набросков сейчас не существуют как отдельные dataclass:
+
+- `DeviceInfo`
 - `PlaybackRequest`
 - `PlaybackState`
-- `PluginCapabilities`
-- `SnapshotResult`
 - `DiagnosticBaseline`
 - `DiagnosticDiff`
-- `DiagnosticReport`
-- `ArchiveCoverageReport`
-- `VideoHostBinding`
 
-### Основной plugin contract
+Их роль закрывается текущими структурами `RuntimeConfig`, `DiagnosticState` и внутренним состоянием `ui.py` / `hikvision_plugin.py`.
 
-Каждый backend должен реализовать единый контракт уровня устройства:
+---
 
-- `connect(params)`
-- `disconnect()`
-- `get_device_info()`
-- `list_channels()`
+## Фактический public contract уровня `core.py`
+
+Слой `core.py` сейчас является практическим API для UI.
+
+### Diagnostics / config
+
+- `run_initial_diagnostic(...)`
+- `run_saved_diagnostic(...)`
+- `load_runtime_config()`
+- `save_runtime_config(config)`
+
+### Common
+
 - `get_capabilities()`
+- `list_channels(...)`
 
-### Live contract
+### Archive
 
-- `start_live(channel_id, profile, host_binding)`
-- `stop_live(session_id)`
-- `switch_live_profile(session_id, profile)`
-- `request_live_snapshot(channel_id | session_id)`
+- `list_archive_days(...)`
+- `list_archive_files(...)`
+- `list_archive_segments(...)`
+- `download_archive_by_time(...)`
+- `start_archive_playback(...)`
+- `stop_archive_playback(...)`
+- `seek_archive_playback(...)`
+- `pause_archive_playback(...)`
+- `resume_archive_playback(...)`
+- `set_archive_playback_speed(...)`
+- `step_archive_playback_frame(...)`
+- `get_archive_playback_time(...)`
 
-### Archive contract
+### Live
 
-- `list_archive_days(channel_id, year, month)`
-- `list_archive_segments(channel_id, period_start, period_end)`
-- `start_archive_playback(request, host_binding)`
-- `seek_archive(session_id, target_time)`
-- `pause_archive(session_id)`
-- `resume_archive(session_id)`
-- `set_archive_speed(session_id, rate)`
-- `step_archive_frame(session_id)`
-- `stop_archive(session_id)`
+- `start_live(...)`
+- `stop_live(...)`
+- `switch_live_profile(...)`
+- `start_live_preview(...)`
+- `stop_live_preview(...)`
+- `request_live_snapshot(...)`
 
-### Video surface contract
+### Surface / zoom
 
-- `bind_surface(host_binding)`
-- `resize_surface(session_id, width, height)`
-- `set_zoom(session_id, zoom_state)`
-- `reset_zoom(session_id)`
+- `resize_surface(...)`
+- `set_zoom(...)`
+- `reset_zoom(...)`
 
-### Diagnostics contract
+### Reports
 
-- `read_current_configuration()`
-- `compare_with_baseline(baseline)`
-- `build_support_report()`
+- `build_archive_coverage_report(...)`
 
-### Coverage/report contract
-
-- `build_archive_coverage_report(channel_ids, period_start, period_end)`
+Это и есть реальный прикладной контракт текущего GTK приложения.
 
 ---
 
 ## Capability model
 
-Каждый plugin обязан возвращать `PluginCapabilities`.
-
-### Примеры capability-флагов
+`PluginCapabilities` сейчас содержит:
 
 - `supports_live`
 - `supports_archive`
+- `supports_archive_download`
 - `supports_native_surface_binding`
 - `supports_grid_low_res_profile`
 - `supports_profile_switch`
@@ -226,61 +270,56 @@ Backends будут асимметричны:
 - `supports_diagnostics`
 - `supports_archive_coverage_report`
 
-UI должен не предполагать возможности backend, а читать их из capability model.
+Для `HikvisionPlugin` capability-значения формируются в [hikvision_plugin.py](/home/klimm/py-hik-sdk-opengl/sdk-hik-GTK/hikvision_plugin.py:2584).
+
+Практическое правило: UI должен включать и выключать поведение на основе capabilities, а не по имени backend.
 
 ---
 
 ## Потоковая модель
 
-GTK-приложение должно быть двухконтурным по исполнению.
+Текущая модель уже не однопоточная в backend-слое.
 
-### Поток 1: GTK UI thread
+### GTK UI thread
 
-Только:
+Здесь остаются только:
 
-- окно;
-- события мыши и клавиатуры;
-- drawing timeline;
-- layout;
-- обновление виджетов;
-- отображение статуса.
+- GTK widgets;
+- input events;
+- timeline drawing;
+- status updates;
+- переключение экранов и состояний.
 
-В этом потоке нельзя выполнять:
+### `core.executor`
 
-- долгие SDK вызовы;
-- сетевые запросы;
-- диагностику;
-- поиск архива;
-- запуск/остановку тяжёлых live/archive операций.
+Основной worker для:
 
-### Поток 2: Backend worker thread
-
-Только:
-
-- plugin operations;
-- connect/disconnect;
-- list channels / archive;
-- playback start/stop/seek;
 - diagnostics;
-- archive coverage report;
-- snapshot requests.
+- list channels;
+- list archive days/files/segments;
+- archive playback control;
+- live start/stop/switch;
+- snapshot requests;
+- coverage report.
 
-Все результаты возвращаются в GTK thread через безопасный механизм:
+### `core.download_executor`
 
-- `GLib.idle_add(...)`
-- либо собственный event dispatcher поверх `queue + idle_add`.
+Отдельный worker для:
+
+- `download_archive_by_time`;
+- очереди download-задач.
+
+Это сделано специально, чтобы длительное скачивание не блокировало:
+
+- подсветку календаря;
+- загрузку списка архива за день;
+- archive playback;
+- coverage report;
+- прочие archive/live операции.
 
 ### Внутренние потоки backend
 
-Внутри plugin могут существовать дополнительные внутренние потоки:
-
-- у `HCNetSDK / PlayCtrl`
-- у `GStreamer`
-
-Но на уровне приложения основной контракт — это:
-
-- `GTK thread`
-- `worker thread`
+Дополнительно внутри SDK могут жить собственные потоки `HCNetSDK` / `PlayCtrl`, но они не являются публичной архитектурой приложения.
 
 ---
 
@@ -288,264 +327,177 @@ GTK-приложение должно быть двухконтурным по �
 
 ### Grid
 
-Правила:
+Текущие правила:
 
-- grid запускает каналы в low-res/substream;
-- grid не должен грузить main stream на все ячейки;
-- grid ячейки должны уметь показать:
-  - online/offline;
-  - last frame / snapshot;
-  - diagnostic warning;
-  - stream status.
+- grid использует `LIVE_PROFILE_SUB`, если backend сообщает `supports_grid_low_res_profile=True`;
+- иначе grid падает обратно на `LIVE_PROFILE_MAIN`;
+- у каждой ячейки есть собственное состояние:
+  - live stream;
+  - snapshot;
+  - snapshot error;
+  - empty slot.
 
-### Focus / Fullscreen
+### Focus
 
-При раскрытии камеры:
+Текущая реализация:
 
-1. backend останавливает или понижает grid-session этой камеры;
-2. запускается high-res/main stream;
-3. video host переключается в focus/fullscreen;
-4. при наличии capabilities включается zoom.
+1. при открытии live focus для канала grid-session этой камеры останавливается;
+2. запускается `LIVE_PROFILE_MAIN`;
+3. focus показывает либо live host, либо snapshot view;
+4. при закрытии focus grid может быть перезапущен.
 
-При возврате:
+Fullscreen в текущем коде отсутствует.
 
-1. high-res session завершается;
-2. grid session восстанавливается на low-res.
+### Snapshots
 
----
+Snapshots уже являются частью live screen:
 
-## Timeline архитектура
-
-`timeline.py` — отдельный модуль.
-
-Он не должен зависеть от производителя.
-
-### Что должно жить в `timeline.py`
-
-- модель диапазона времени;
-- масштаб и zoom timeline;
-- преобразования `time <-> x`;
-- hit-testing;
-- hover/select/seek logic;
-- drawing GTK timeline widget;
-- отображение archive segments и current cursor.
-
-### Что НЕ должно жить в `timeline.py`
-
-- запрос архива к устройству;
-- vendor SDK вызовы;
-- playback control;
-- диагностика.
-
-Timeline должен получать уже подготовленные данные:
-
-- `ArchiveSegment[]`
-- `current_playback_time`
-- `visible bounds`
+- запрашиваются для всех видимых каналов активного вида;
+- декодируются в `GdkPixbuf`;
+- показываются прямо в grid;
+- могут быть открыты в snapshot focus.
 
 ---
 
-## Архитектура диагностики
+## Archive screen model
 
-Диагностика — отдельный режим приложения.
+### Calendar / archive discovery
 
-### Baseline
+Текущая UI-модель работает так:
 
-Baseline-конфигурация должна хранить:
+- канал выбирается в `Archive` tab;
+- по месяцу загружается множество дней с архивом;
+- по выбранному дню запрашиваются:
+  - список файлов;
+  - список segments для timeline.
 
-- идентификатор устройства;
-- эталонный список каналов;
-- expected names;
-- expected stream profiles;
+### Playback
+
+Archive playback сейчас поддерживает:
+
+- start by file selection;
+- seek by timeline;
+- stop;
+- pause/resume;
+- speed;
+- frame step;
+- polling playback time;
+- zoom/pan.
+
+### Download queue
+
+Archive download сейчас:
+
+- принимает `ArchiveDownloadRequest`;
+- создаёт UI queue;
+- выполняет задачи последовательно;
+- не монополизирует основной archive worker.
+
+---
+
+## Diagnostics model
+
+Текущая diagnostics-модель уже проще, чем ранняя проектная версия.
+
+### Что хранится в baseline/runtime config
+
+Сейчас сохраняются:
+
+- connection params;
+- detected mode;
+- `baseline_channels`;
+- `current_channels`;
+- summary последней диагностики;
+- online views и selected view.
+
+### Что не хранится в baseline
+
+Пока не реализованы:
+
 - expected resolutions/fps;
-- mapping logical channel <-> backend channel id;
-- ожидания по архиву.
+- expected stream profiles;
+- logical mapping beyond current channel numbers;
+- archive expectations per channel;
+- отдельный device info baseline object.
 
-### Current snapshot
+### Current diagnostic output
 
-Plugin должен уметь собрать текущее состояние:
+Сейчас UI показывает:
 
-- device info;
-- channels present/missing;
-- online/offline;
-- stream params;
-- archive availability;
-- last errors.
-
-### Diagnostic diff
-
-Сравнение baseline с current snapshot должно показывать:
-
-- отсутствующие каналы;
-- новые/лишние каналы;
-- mismatch по названиям;
-- mismatch по stream profile;
-- mismatch по разрешению/FPS;
-- offline каналы;
-- отсутствие архива там, где он ожидается;
-- ошибки соединения и SDK.
-
-### Support report
-
-Отчёт должен быть пригоден для техподдержки:
-
-- human-readable summary;
-- структурированный JSON;
-- timestamps;
-- platform info;
-- plugin name/version;
-- backend-specific errors.
+- текстовый diagnostic summary;
+- таблицу diff по каналам;
+- baseline/current comparison по status и presence.
 
 ---
 
-## Архитектура отчёта по архиву
+## Coverage report model
 
-Отчёт по архиву должен быть отдельным use case, а не побочным продуктом timeline.
+Текущая реализация coverage report уже рабочая, но уже, чем ранняя целевая формулировка.
 
-### Вход
+### Реально поддерживается
 
-- список каналов;
-- произвольный период времени;
-- опциональные фильтры.
+- один канал;
+- произвольный период;
+- общий процент покрытия;
+- covered seconds / total seconds;
+- число segment'ов;
+- список gaps;
+- текстовый вывод.
 
-### Выход
+### Пока не поддерживается
 
-- summary по каждому каналу;
-- интервалы наличия архива;
-- интервалы отсутствия;
-- процент покрытия;
-- агрегирование по дням/часам;
-- machine-readable report object.
-
----
-
-## Структура файлов GTK-версии
-
-Целевая файловая структура:
-
-```text
-sdk-hik-GTK/
-├── app.py
-├── contracts.py
-├── core.py
-├── hikvision_plugin.py
-├── macroscop.py
-├── timeline.py
-├── ui.py
-├── ARCHITECTURE.md
-└── demo_gtk_timeline.py
-```
-
-### Назначение файлов
-
-#### `app.py`
-
-- точка входа;
-- bootstrap GTK app;
-- инициализация `core`;
-- запуск `ui`.
-
-#### `contracts.py`
-
-- dataclasses;
-- enums;
-- Protocol/ABC;
-- capability model.
-
-#### `core.py`
-
-- orchestration layer;
-- plugin selection;
-- session lifecycle;
-- worker thread;
-- event bridge в GTK thread;
-- сценарии `live/archive/diagnostics/report`.
-
-#### `hikvision_plugin.py`
-
-- Hikvision-specific SDK binding;
-- PlayCtrl integration;
-- native zoom/render;
-- archive/live implementation.
-
-#### `macroscop.py`
-
-- Macroscop-specific backend;
-- вероятная реализация через `GStreamer`;
-- live/archive/report implementation в рамках тех же contracts.
-
-#### `timeline.py`
-
-- GTK timeline widget;
-- timeline model;
-- drawing and interaction.
-
-#### `ui.py`
-
-- главное окно;
-- grid;
-- focus/fullscreen;
-- controls;
-- diagnostics/report screens;
-- интеграция с `core`.
+- multi-channel aggregation;
+- day/hour aggregation output;
+- machine-readable export вне текущего Python object;
+- отдельные filters в UI.
 
 ---
 
-## Миграция с Qt-версии
+## Conformance notes
 
-Перенос должен идти не "по файлам", а по слоям.
+Ниже список ключевых расхождений между старой проектной архитектурой и текущим кодом.
 
-### Переносимый слой
+### Уже реализовано, но раньше было описано как будущее
 
-Из Qt-версии можно переносить:
+- `Gtk.Revealer` sidebar для `Онлайн`;
+- screenshots;
+- snapshot display в grid;
+- snapshot focus;
+- grid substream / focus main stream;
+- archive download queue;
+- разделение worker и download worker.
 
-- playback/business logic;
-- архивные запросы;
-- часть PlayCtrl integration;
-- timeline math;
-- domain objects.
+### Было заявлено слишком широко, но в коде уже есть более узкая реализация
 
-### Не переносить напрямую
+- coverage report сейчас single-channel, а не multi-channel;
+- diagnostics baseline хранит channel baseline, а не полную device expectation model;
+- contracts сейчас concrete dataclasses, а не ABC/Protocol слой;
+- второй backend plugin пока отсутствует.
 
-Не переносить один-в-один:
+### Всё ещё roadmap
 
-- Qt widget hierarchy;
-- `PySide6` event model;
-- старую структуру `main_window.py / native_widget.py / timeline.py` как есть.
-
-### Порядок миграции
-
-1. описать `contracts.py`;
-2. собрать `core.py`;
-3. вынести `hikvision_plugin.py`;
-4. сделать GTK timeline;
-5. сделать GTK main UI;
-6. добавить diagnostics/report mode;
-7. добавить второй backend plugin.
+- fullscreen focus mode;
+- отдельный support report/JSON export;
+- multi-vendor plugin;
+- более богатая diagnostics expectation model.
 
 ---
 
-## Итоговая целевая схема
+## Практический вывод
 
-```text
-GTK UI
-   │
-   ▼
-core.py
-   │
-   ├── hikvision_plugin.py  -> HCNetSDK + PlayCtrl
-   └── macroscop.py         -> GStreamer / vendor transport
+На текущий момент GTK-ветка уже является рабочим приложением с пятью реальными сценариями:
 
-timeline.py
-   ▲
-   │
-normalized archive/live state from core
-```
+- diagnostics;
+- archive playback;
+- archive download;
+- live grid/focus со snapshots;
+- archive coverage report.
 
-Главный результат этой архитектуры:
+Архитектурно проект сейчас лучше описывать как:
 
-- UI общий;
-- timeline общий;
-- backend различается только на plugin-уровне;
-- число файлов минимально;
-- live/archive/diagnostics/report заложены сразу, а не достраиваются потом поверх старой архитектуры.
+- один реальный backend `HikvisionPlugin`;
+- capability-driven UI;
+- concrete contracts в `contracts.py`;
+- `core.py` как orchestration facade;
+- два backend executors: общий и download-specific;
+- roadmap на fullscreen, richer diagnostics и second backend.
