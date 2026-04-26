@@ -392,6 +392,10 @@ class MainWindow(Gtk.Window):
         self._zoom_start_x = 0.0
         self._zoom_start_y = 0.0
 
+        self.archive_calendar_request_id = 0
+        self.archive_calendar_year_month: tuple[int, int] | None = None
+        self.archive_calendar_channel: int | None = None
+
         self.set_default_size(1380, 920)
         self.connect("destroy", self._on_destroy)
 
@@ -403,9 +407,10 @@ class MainWindow(Gtk.Window):
         root.pack_start(self.notebook, True, True, 0)
 
         self.notebook.append_page(self._build_online_tab(), Gtk.Label(label="Онлайн"))
-        self.notebook.append_page(self._build_archive_tab(), Gtk.Label(label="Архив"))
+        self.archive_tab_index = self.notebook.append_page(self._build_archive_tab(), Gtk.Label(label="Архив"))
         self.notebook.append_page(self._build_reports_tab(), Gtk.Label(label="Отчёты"))
         self.notebook.append_page(self._build_system_tab(), Gtk.Label(label="Система"))
+        self.notebook.connect("switch-page", self._on_notebook_switch_page)
 
         # Keep internal status storage without rendering a dedicated status panel.
         self.status_label = Gtk.Label(xalign=0.0)
@@ -1711,6 +1716,9 @@ class MainWindow(Gtk.Window):
         self.channel_combo = Gtk.ComboBoxText()
         self.channel_combo.connect("changed", self._on_archive_channel_changed)
         self.calendar = Gtk.Calendar()
+        self.calendar.connect("notify::month", self._on_archive_calendar_month_changed)
+        self.calendar.connect("notify::year", self._on_archive_calendar_month_changed)
+        self.calendar.connect("day-selected", self._on_archive_calendar_day_selected)
 
         controls.attach(Gtk.Label(label="Channel", xalign=0.0), 0, 0, 1, 1)
         controls.attach(self.channel_combo, 1, 0, 1, 1)
@@ -2065,6 +2073,72 @@ class MainWindow(Gtk.Window):
         year, month_zero, day = self.calendar.get_date()
         return datetime(int(year), int(month_zero) + 1, int(day))
 
+    def _refresh_archive_calendar_days(self) -> None:
+        channel = self._try_selected_channel()
+        if channel is None:
+            self.calendar.clear_marks()
+            self.archive_calendar_year_month = None
+            return
+
+        year, month_zero, _ = self.calendar.get_date()
+        year = int(year)
+        month = int(month_zero) + 1
+        month_key = (year, month)
+        if self.archive_calendar_year_month == month_key and self.archive_calendar_channel == channel:
+            return
+
+        self.archive_calendar_year_month = month_key
+        self.archive_calendar_channel = channel
+        self.archive_calendar_request_id += 1
+        request_id = self.archive_calendar_request_id
+        self.calendar.clear_marks()
+        self._set_status(f"Loading archive availability for channel {channel} {year}-{month:02d}...")
+
+        self.core.list_archive_days(
+            channel=channel,
+            year=year,
+            month=month,
+            on_done=lambda days, req_id=request_id, expected_channel=channel, expected_year=year, expected_month=month: self._handle_archive_days(
+                expected_channel, expected_year, expected_month, set(days), req_id
+            ),
+            on_error=lambda message, req_id=request_id: self._handle_archive_days_error(message, req_id),
+        )
+
+    def _handle_archive_days(
+        self,
+        channel: int,
+        year: int,
+        month: int,
+        days: set[int],
+        request_id: int,
+    ) -> bool:
+        if request_id != self.archive_calendar_request_id:
+            return False
+        current_channel = self._try_selected_channel()
+        if current_channel != channel:
+            return False
+        self.calendar.clear_marks()
+        for day in sorted(days):
+            if 1 <= day <= 31:
+                self.calendar.mark_day(day)
+        self._set_status(
+            f"Archive availability loaded for channel {channel} {year}-{month:02d}: {len(days)} days"
+        )
+        return False
+
+    def _handle_archive_days_error(self, message: str, request_id: int) -> bool:
+        if request_id != self.archive_calendar_request_id:
+            return False
+        self.calendar.clear_marks()
+        self._set_status(f"Archive availability request failed: {message}")
+        return False
+
+    def _on_archive_calendar_day_selected(self, calendar: Gtk.Calendar) -> None:
+        self._refresh_archive_calendar_days()
+
+    def _on_archive_calendar_month_changed(self, calendar: Gtk.Calendar, param: object) -> None:
+        self._refresh_archive_calendar_days()
+
     def _selected_file(self) -> ArchiveFile | None:
         selection = self.file_tree.get_selection()
         model, treeiter = selection.get_selected()
@@ -2100,6 +2174,15 @@ class MainWindow(Gtk.Window):
             if combo is not source and combo.get_active() != index:
                 combo.set_active(index)
         self._syncing_channel_selection = False
+
+    def _on_notebook_switch_page(
+        self,
+        notebook: Gtk.Notebook,
+        page: Gtk.Widget,
+        page_num: int,
+    ) -> None:
+        if page_num == self.archive_tab_index:
+            self._refresh_archive_calendar_days()
 
     def _set_playback_info(self, text: str) -> None:
         self.playback_info_label.set_text(text)
@@ -2610,6 +2693,8 @@ class MainWindow(Gtk.Window):
             return
         item = self.current_channels[combo.get_active()]
         self._set_status(f"Selected channel {channel}: {item.status_text} ({item.flags_text()})")
+        if self.notebook.get_current_page() == self.archive_tab_index:
+            self._refresh_archive_calendar_days()
 
     def _on_report_channel_changed(self, combo: Gtk.ComboBoxText) -> None:
         self._sync_channel_combos(combo)
