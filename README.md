@@ -1,54 +1,54 @@
 # MegaVMS GTK
 
-GTK-based Hikvision desktop client for Linux/X11.
+GTK-клиент для Hikvision под Linux/X11.
 
-This repository contains the current GTK implementation of the project that was split out from a larger local workspace. The app works directly with the native Hikvision Linux SDK (`HCNetSDK` + `PlayCtrl`) and is focused on four practical areas:
+Этот репозиторий содержит актуальную GTK-реализацию проекта, вынесенную из более крупного локального рабочего дерева. Приложение работает напрямую с нативным Hikvision Linux SDK (`HCNetSDK` + `PlayCtrl`) и сейчас сфокусировано на четырёх практических направлениях:
 
-- system diagnostics and baseline comparison;
-- archive discovery and playback;
-- archive download queue by time range;
-- live grid/focus viewing with snapshots.
+- системная диагностика и сравнение с базовым состоянием;
+- поиск архива и его воспроизведение;
+- очередь скачивания архива по диапазону времени;
+- live-просмотр в режимах grid/focus со snapshot-кадрами.
 
-## Current status
+## Текущее состояние
 
-The project is already usable, but it is not positioned as a finished multi-vendor VMS yet.
+Проект уже пригоден для работы, но пока не позиционируется как законченная VMS-платформа с поддержкой нескольких вендоров.
 
-Implemented today:
+На данный момент реализовано:
 
-- GTK3 desktop UI with tabs: `Online`, `Archive`, `Reports`, `System`
-- startup and periodic diagnostics
-- saved runtime configuration
-- archive day discovery with calendar marks
+- GTK3-интерфейс с вкладками `Online`, `Archive`, `Reports`, `System`
+- стартовая и периодическая диагностика
+- сохранение runtime-конфигурации
+- определение дней архива с отметками в календаре
 - archive timeline, native playback, seek, pause/resume, speed, frame-step
-- SDK-backed zoom/pan for archive playback
-- archive download queue with a dedicated background worker
-- live grid and focus modes
-- saved custom views and layout presets
-- snapshot capture for visible channels
-- single-channel archive coverage report
+- zoom/pan архива через SDK
+- очередь скачивания архива с отдельным фоновым worker-потоком
+- режимы live grid и live focus
+- пользовательские виды и шаблоны раскладки
+- получение snapshot-кадров для видимых каналов
+- одноканальный отчёт по покрытию архива
 
-Not implemented yet:
+Пока не реализовано:
 
-- fullscreen focus mode
+- fullscreen-режим для focus
 - multi-channel coverage report
-- JSON/export-oriented support report
-- second vendor backend
+- support report и экспорт в JSON / machine-readable формат
+- второй backend другого вендора
 
-## Platform and requirements
+## Платформа и требования
 
-Current target environment:
+Текущая целевая среда:
 
 - Linux
-- X11 session
+- сессия X11
 - Python 3.10+
-- GTK 3 via PyGObject
-- Hikvision Linux SDK libraries available locally
+- GTK 3 через PyGObject
+- локально доступные библиотеки Hikvision Linux SDK
 
-The UI uses X11 window binding for native video surfaces. Wayland is not a supported target in the current implementation.
+Интерфейс использует X11 window binding для нативных видеоповерхностей. Wayland в текущей реализации не является поддерживаемой средой.
 
-Required Hikvision SDK layout is expected under `HIKVISION_LIB_DIR` or, by default, under `~/.local/lib/hikvision`.
+Ожидаемая раскладка Hikvision SDK находится в `HIKVISION_LIB_DIR` или, по умолчанию, в `~/.local/lib/hikvision`.
 
-Minimum expected files:
+Минимально ожидаемая структура:
 
 ```text
 ~/.local/lib/hikvision/
@@ -59,36 +59,36 @@ Minimum expected files:
 └── HCNetSDKCom/
 ```
 
-## Runtime configuration
+## Runtime-конфигурация
 
-The application stores its runtime state in:
+Приложение хранит своё runtime-состояние в:
 
 ```text
 .data/runtime_config.json
 ```
 
-This includes connection settings, diagnostic baseline/current state, and saved online views.
+Там сохраняются параметры подключения, базовое и текущее состояние диагностики, а также сохранённые online views.
 
-## Environment variables
+## Переменные окружения
 
-- `HIKVISION_LIB_DIR`: overrides the default SDK directory
-- `HIK_PLAYER_LOG_LEVEL`: logging level, for example `DEBUG` or `INFO`
-- `HIK_PLAYER_ARCHIVE_DAYS_FALLBACK_SCAN`: optional archive-day fallback scan toggle used by the backend
+- `HIKVISION_LIB_DIR`: переопределяет путь к SDK
+- `HIK_PLAYER_LOG_LEVEL`: уровень логирования, например `DEBUG` или `INFO`
+- `HIK_PLAYER_ARCHIVE_DAYS_FALLBACK_SCAN`: дополнительный backend-флаг для резервного сканирования дней архива
 
-## Quick start
+## Быстрый старт
 
-Install system dependencies for your distro first. At minimum you need Python, GTK3 introspection bindings, and the Hikvision SDK files shown above.
+Сначала установите системные зависимости для своей Linux-системы. Минимально нужны Python, GTK3 introspection bindings и файлы Hikvision SDK, перечисленные выше.
 
-Run the app from the repository root:
+Запуск из корня проекта:
 
 ```bash
 cd sdk-hik-GTK
 python3 app.py
 ```
 
-On startup the launcher ensures `LD_LIBRARY_PATH` includes the Hikvision SDK directory and `HCNetSDKCom`.
+При старте launcher сам проверяет, что `LD_LIBRARY_PATH` включает каталог Hikvision SDK и `HCNetSDKCom`.
 
-## Project structure
+## Структура проекта
 
 ```text
 .
@@ -102,26 +102,26 @@ On startup the launcher ensures `LD_LIBRARY_PATH` includes the Hikvision SDK dir
 └── ARCHITECTURE.md
 ```
 
-High-level roles:
+Роли файлов:
 
-- `app.py`: GTK entrypoint and runtime environment bootstrap
-- `contracts.py`: domain models and capability flags
-- `core.py`: orchestration layer and worker executors
-- `hikvision_plugin.py`: Hikvision-specific SDK integration
-- `timeline.py`: archive timeline widget
-- `ui.py`: GTK screens and interaction logic
+- `app.py`: точка входа GTK и bootstrap runtime environment
+- `contracts.py`: доменные модели и capability flags
+- `core.py`: orchestration layer и worker executors
+- `hikvision_plugin.py`: Hikvision-specific интеграция с SDK
+- `timeline.py`: widget временной шкалы архива
+- `ui.py`: GTK-экраны и пользовательская логика
 
-## Development notes
+## Заметки по разработке
 
-- The backend is currently `HikvisionPlugin` only.
-- `core.py` uses a separate executor for archive downloads so that long downloads do not block the rest of the archive UI.
-- The codebase is capability-driven: the UI enables features based on backend capability flags instead of backend name checks.
+- Сейчас backend только один: `HikvisionPlugin`.
+- В `core.py` используется отдельный executor для archive download, чтобы длинные скачивания не блокировали остальную archive-часть интерфейса.
+- Код построен по capability-driven модели: интерфейс включает и выключает возможности на основе capability flags, а не по имени backend.
 
-## Documentation
+## Документация
 
-Additional project documents:
+Дополнительные документы проекта:
 
-- [ARCHITECTURE.md](ARCHITECTURE.md): current code-oriented architecture description
-- [TODO.md](TODO.md): implemented scope and deferred items
+- [ARCHITECTURE.md](ARCHITECTURE.md): текущее описание архитектуры по фактическому коду
+- [TODO.md](TODO.md): реализованный scope и отложенные задачи
 
-These documents currently reflect the actual code more closely than older design assumptions.
+Эти документы сейчас ближе к реальному состоянию кода, чем более ранние проектные наброски.
